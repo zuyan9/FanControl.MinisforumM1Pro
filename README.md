@@ -8,10 +8,16 @@ FanControl's PawnIO stack and exposes:
 - CPU and system temperature from onboard EC;
 - CPU and system fan controls.
 
+<img width="650" alt="image" src="https://github.com/user-attachments/assets/f02dcb36-28c6-4523-bc50-71c186b99fe3" />
+<img width="350" alt="image" src="https://github.com/user-attachments/assets/6e94fff1-f59f-429b-8265-fdc747283ac9" />
+
+
+
+
 # Install
 
-Download the latest [release](https://github.com/zuyan9/FanControl.MinisforumM1Pro/releases),
-start FanControl, then install the plugin under **Settings > Plugins > Install plugin**.
+Download the latest plugin [release](https://github.com/zuyan9/FanControl.MinisforumM1Pro/releases),
+start FanControl, then install the plugin under **Settings > Plugins > Install plugin...**
 FanControl refreshes its sensors after installation.
 
 ## Compatibility
