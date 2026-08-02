@@ -5,8 +5,20 @@ the Minisforum M1 Pro. It reads the machine's embedded controller (EC) through
 FanControl's PawnIO stack and exposes:
 
 - CPU and system fan RPM;
-- EC CPU and system temperatures;
-- independent, paired CPU and system fan controls.
+- CPU and system temperature from onboard EC;
+- CPU and system fan controls.
+
+<img width="650" alt="image" src="https://github.com/user-attachments/assets/f02dcb36-28c6-4523-bc50-71c186b99fe3" />
+<img width="350" alt="image" src="https://github.com/user-attachments/assets/6e94fff1-f59f-429b-8265-fdc747283ac9" />
+
+
+
+
+# Install
+
+Download the latest plugin [release](https://github.com/zuyan9/FanControl.MinisforumM1Pro/releases),
+start FanControl, then install the plugin under **Settings > Plugins > Install plugin...**
+FanControl refreshes its sensors after installation.
 
 ## Compatibility
 
@@ -32,7 +44,7 @@ FanControl owns calibration, curves, and start/stop policy. Run calibration
 for both paired controls after installation. Expect a sharp transition from
 off through 12% to running at 13%.
 
-## Build and install
+## Build
 
 Install the .NET 10 SDK and FanControl, then run from this directory:
 
@@ -40,11 +52,6 @@ Install the .NET 10 SDK and FanControl, then run from this directory:
 dotnet build -c Release
 dotnet run --project .\tests\FanControl.MinisforumM1Pro.Tests.csproj -c Release
 ```
-
-Start FanControl as administrator. Under **Settings > Plugins > Install
-plugin**, select either the release ZIP or
-`bin\Release\net10.0-windows\FanControl.MinisforumM1Pro.dll`. The ZIP contains
-only the plugin DLL; FanControl refreshes its sensors after installation.
 
 
 ## Recovery behavior
