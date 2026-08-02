@@ -1,0 +1,168 @@
+name: Build and release
+
+on:
+  push:
+    branches:
+      - "**"
+    tags:
+      - "v*"
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    name: Build and test
+    runs-on: windows-latest
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v7
+
+      - name: Set up .NET
+        uses: actions/setup-dotnet@v6
+        with:
+          dotnet-version: 10.0.x
+
+      - name: Download FanControl V272 references
+        shell: pwsh
+        run: |
+          $archive = Join-Path $env:RUNNER_TEMP "FanControl_272_net_10_0.zip"
+          $extractDir = Join-Path $env:RUNNER_TEMP "FanControl_272_net_10_0"
+          $uri = "https://github.com/Rem0o/FanControl.Releases/releases/download/V272/FanControl_272_net_10_0.zip"
+          $expectedHash = "5f84c3514b213ea040051c595f1915d9c75e3b5f1c9d7b9b39353f6bbbcd2b80"
+
+          Invoke-WebRequest -Uri $uri -OutFile $archive
+          $actualHash = (Get-FileHash -LiteralPath $archive -Algorithm SHA256).Hash.ToLowerInvariant()
+          if ($actualHash -ne $expectedHash) {
+              throw "FanControl archive checksum mismatch: $actualHash"
+          }
+
+          Expand-Archive -LiteralPath $archive -DestinationPath $extractDir -Force
+          $pluginApi = Get-ChildItem -LiteralPath $extractDir -Recurse -File -Filter "FanControl.Plugins.dll" |
+              Select-Object -First 1
+          if ($null -eq $pluginApi) {
+              throw "FanControl.Plugins.dll was not found in the verified archive."
+          }
+
+          $fanControlDir = $pluginApi.Directory.FullName
+          "FANCONTROL_DIR=$fanControlDir" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+
+      - name: Select plugin version
+        shell: pwsh
+        env:
+          REF_NAME: ${{ github.ref_name }}
+          REF_TYPE: ${{ github.ref_type }}
+        run: |
+          if ($env:REF_TYPE -eq "tag") {
+              if ($env:REF_NAME -notmatch '^v(?<version>\d+\.\d+\.\d+)$') {
+                  throw "Release tags must use SemVer syntax such as v1.2.3."
+              }
+              $version = $Matches.version
+          }
+          else {
+              $version = "0.0.0-ci.$env:GITHUB_RUN_NUMBER"
+          }
+
+          "PLUGIN_VERSION=$version" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+
+      - name: Build plugin
+        shell: pwsh
+        run: |
+          dotnet build .\FanControl.MinisforumM1Pro.csproj `
+              --configuration Release `
+              "-p:FanControlDir=$env:FANCONTROL_DIR" `
+              "-p:Version=$env:PLUGIN_VERSION" `
+              -p:ContinuousIntegrationBuild=true
+
+      - name: Run hardware-free tests
+        shell: pwsh
+        run: |
+          dotnet run `
+              --project .\tests\FanControl.MinisforumM1Pro.Tests.csproj `
+              --configuration Release `
+              "-p:FanControlDir=$env:FANCONTROL_DIR" `
+              "-p:Version=$env:PLUGIN_VERSION" `
+              -p:ContinuousIntegrationBuild=true
+
+      - name: Package release assets
+        if: startsWith(github.ref, 'refs/tags/v')
+        shell: pwsh
+        run: |
+          $outputDir = Join-Path $env:GITHUB_WORKSPACE "bin\Release\net10.0-windows"
+          $sourceDll = Join-Path $outputDir "FanControl.MinisforumM1Pro.dll"
+          if (-not (Test-Path -LiteralPath $sourceDll)) {
+              throw "Built plugin DLL was not found: $sourceDll"
+          }
+
+          $releaseDir = Join-Path $env:GITHUB_WORKSPACE "release-assets"
+          New-Item -ItemType Directory -Path $releaseDir -Force | Out-Null
+          $releaseDll = Join-Path $releaseDir "FanControl.MinisforumM1Pro.dll"
+          $releaseZip = Join-Path $releaseDir "FanControl.MinisforumM1Pro.zip"
+          Copy-Item -LiteralPath $sourceDll -Destination $releaseDll
+          Compress-Archive -LiteralPath $releaseDll -DestinationPath $releaseZip -CompressionLevel Optimal
+
+          Add-Type -AssemblyName System.IO.Compression.FileSystem
+          $archive = [IO.Compression.ZipFile]::OpenRead($releaseZip)
+          try {
+              $entries = @($archive.Entries)
+              if ($entries.Count -ne 1 -or $entries[0].FullName -ne "FanControl.MinisforumM1Pro.dll") {
+                  throw "Release ZIP must contain only the plugin DLL at its root."
+              }
+          }
+          finally {
+              $archive.Dispose()
+          }
+
+          $checksums = @($releaseDll, $releaseZip) | ForEach-Object {
+              $hash = (Get-FileHash -LiteralPath $_ -Algorithm SHA256).Hash.ToLowerInvariant()
+              "$hash  $([IO.Path]::GetFileName($_))"
+          }
+          $checksums | Set-Content -LiteralPath (Join-Path $releaseDir "SHA256SUMS.txt") -Encoding ascii
+
+      - name: Upload release assets
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: actions/upload-artifact@v7
+        with:
+          name: release-assets
+          path: release-assets/*
+          if-no-files-found: error
+
+  release:
+    name: Publish GitHub release
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: build
+    runs-on: windows-latest
+    permissions:
+      contents: write
+
+    steps:
+      - name: Download release assets
+        uses: actions/download-artifact@v8
+        with:
+          name: release-assets
+          path: release-assets
+
+      - name: Create GitHub release
+        shell: pwsh
+        env:
+          GH_REPO: ${{ github.repository }}
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ github.ref_name }}
+        run: |
+          $assets = Get-ChildItem -LiteralPath .\release-assets -File |
+              Sort-Object Name |
+              ForEach-Object FullName
+          if ($assets.Count -ne 3) {
+              throw "Expected exactly three release assets."
+          }
+
+          gh release create $env:RELEASE_TAG @assets `
+              --verify-tag `
+              --title $env:RELEASE_TAG `
+              --generate-notes

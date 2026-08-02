@@ -120,7 +120,7 @@ public sealed class M1ProPlugin : IPlugin2
         }
         catch (Exception exception)
         {
-            Log($"Minisforum M1 Pro stock restoration failed: {exception.Message}");
+            Log($"Minisforum M1 Pro baseline restoration failed: {exception.Message}");
         }
     }
 

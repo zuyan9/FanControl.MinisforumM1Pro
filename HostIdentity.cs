@@ -1,48 +1,24 @@
-using System.Management;
+using Microsoft.Win32;
 
 namespace FanControl.MinisforumM1Pro;
 
-internal sealed record HostIdentity(string Manufacturer, string Product, string Board);
-
-internal interface IHostIdentityReader
+internal static class HostIdentity
 {
-    HostIdentity Read();
-}
+    private const string BiosKey =
+        @"HKEY_LOCAL_MACHINE\HARDWARE\DESCRIPTION\System\BIOS";
 
-internal sealed class WmiHostIdentityReader : IHostIdentityReader
-{
-    public HostIdentity Read()
-    {
-        using ManagementObject system = ReadOne(
-            "SELECT Manufacturer, Model FROM Win32_ComputerSystem");
-        using ManagementObject board = ReadOne(
-            "SELECT Product FROM Win32_BaseBoard");
-        return new HostIdentity(
-            Convert.ToString(system["Manufacturer"])?.Trim() ?? string.Empty,
-            Convert.ToString(system["Model"])?.Trim() ?? string.Empty,
-            Convert.ToString(board["Product"])?.Trim() ?? string.Empty);
-    }
-
-    private static ManagementObject ReadOne(string query)
-    {
-        using ManagementObjectSearcher searcher = new(query);
-        using ManagementObjectCollection results = searcher.Get();
-        return results.Cast<ManagementObject>().FirstOrDefault() ??
-            throw new InvalidOperationException($"WMI query returned no result: {query}");
-    }
+    internal static string ReadBoard() => Convert.ToString(
+        Registry.GetValue(BiosKey, "BaseBoardProduct", null))?.Trim() ?? string.Empty;
 }
 
 internal static class HostIdentityGate
 {
-    internal static void AssertExact(HostIdentity host)
+    internal static void AssertBoard(string board)
     {
-        if (host.Manufacturer != ArbscProfile.Manufacturer ||
-            host.Product != ArbscProfile.Product ||
-            host.Board != ArbscProfile.Board)
+        if (!string.Equals(board, ArbscProfile.Board, StringComparison.Ordinal))
         {
             throw new PlatformNotSupportedException(
-                $"Expected {ArbscProfile.Product}/{ArbscProfile.Board}; found " +
-                $"{host.Product}/{host.Board}.");
+                $"Expected baseboard {ArbscProfile.Board}; found {board}.");
         }
     }
 }

@@ -10,9 +10,9 @@ internal static class Program
         [
             ("profile percentage mapping", ProfilePercentageMapping),
             ("profile deadzone normalization", ProfileDeadzoneNormalization),
-            ("profile write order", ProfileWriteOrder),
+            ("profile write and restore order", ProfileWriteOrder),
             ("telemetry decoding", TelemetryDecoding),
-            ("host identity gate", HostIdentityGateTest),
+            ("board identity gate", BoardIdentityGateTest),
             ("backend initialization gates", BackendInitializationGates),
             ("backend transactions", BackendTransactions),
             ("backend failure restoration", BackendFailureRestoration),
@@ -74,6 +74,7 @@ internal static class Program
 
     private static void ProfileWriteOrder()
     {
+        byte[] baseline = ArbitraryBaseline();
         EcWrite[] expectedCpuManual = Enumerable.Range(0x0670, 8)
             .Select(address => new EcWrite((ushort)address, 0))
             .Concat(Enumerable.Range(0, 8).Select(row =>
@@ -90,43 +91,34 @@ internal static class Program
             expectedSystemManual,
             ArbscProfile.ManualWrites(ArbscFan.System, 44));
 
-        ushort[] expectedCpuStockAddresses = Enumerable.Range(0, 8)
+        ushort[] expectedCpuRestoreAddresses = Enumerable.Range(0, 8)
             .Select(row => (ushort)(0x0640 + (row * 3)))
             .Concat(Enumerable.Range(0x0670, 8).Select(address => (ushort)address))
             .ToArray();
         SequenceEqual(
-            expectedCpuStockAddresses,
-            ArbscProfile.StockWrites(ArbscFan.Cpu).Select(write => write.Address));
+            expectedCpuRestoreAddresses,
+            ArbscProfile.RestoreWrites(ArbscFan.Cpu, baseline)
+                .Select(write => write.Address));
 
-        ushort[] expectedSystemStockAddresses = Enumerable.Range(0, 7)
+        ushort[] expectedSystemRestoreAddresses = Enumerable.Range(0, 7)
             .Select(row => (ushort)(0x0658 + (row * 3)))
             .Concat(Enumerable.Range(0x0678, 7).Select(address => (ushort)address))
             .ToArray();
         SequenceEqual(
-            expectedSystemStockAddresses,
-            ArbscProfile.StockWrites(ArbscFan.System).Select(write => write.Address));
+            expectedSystemRestoreAddresses,
+            ArbscProfile.RestoreWrites(ArbscFan.System, baseline)
+                .Select(write => write.Address));
 
-        EcWrite[] allStock = ArbscProfile.AllStockWrites();
-        Equal(30, allStock.Length);
+        EcWrite[] allRestore = ArbscProfile.AllRestoreWrites(baseline);
+        Equal(30, allRestore.Length);
         SequenceEqual(
-            ArbscProfile.StockWrites(ArbscFan.Cpu),
-            allStock.Take(16));
+            ArbscProfile.RestoreWrites(ArbscFan.Cpu, baseline),
+            allRestore.Take(16));
         SequenceEqual(
-            ArbscProfile.StockWrites(ArbscFan.System),
-            allStock.Skip(16));
-
-        foreach (EcWrite write in ArbscProfile.StockWrites(ArbscFan.Cpu))
-        {
-            Equal(
-                ArbscProfile.StockCurve[write.Address - ArbscProfile.CurveStart],
-                write.Value);
-        }
-        foreach (EcWrite write in ArbscProfile.StockWrites(ArbscFan.System))
-        {
-            Equal(
-                ArbscProfile.StockCurve[write.Address - ArbscProfile.CurveStart],
-                write.Value);
-        }
+            ArbscProfile.RestoreWrites(ArbscFan.System, baseline),
+            allRestore.Skip(16));
+        SequenceEqual(ArbscProfile.OwnedAddresses, allRestore.Select(write => write.Address));
+        SequenceEqual(baseline, allRestore.Select(write => write.Value));
     }
 
     private static void TelemetryDecoding()
@@ -148,15 +140,10 @@ internal static class Program
         Throws<ArgumentException>(() => ArbscTelemetryDecoder.Decode([0, 1, 2]));
     }
 
-    private static void HostIdentityGateTest()
+    private static void BoardIdentityGateTest()
     {
-        HostIdentityGate.AssertExact(ExactHost());
-        Throws<PlatformNotSupportedException>(() => HostIdentityGate.AssertExact(
-            new HostIdentity("Other", ArbscProfile.Product, ArbscProfile.Board)));
-        Throws<PlatformNotSupportedException>(() => HostIdentityGate.AssertExact(
-            new HostIdentity(ArbscProfile.Manufacturer, "Other", ArbscProfile.Board)));
-        Throws<PlatformNotSupportedException>(() => HostIdentityGate.AssertExact(
-            new HostIdentity(ArbscProfile.Manufacturer, ArbscProfile.Product, "Other")));
+        HostIdentityGate.AssertBoard(ArbscProfile.Board);
+        Throws<PlatformNotSupportedException>(() => HostIdentityGate.AssertBoard("Other"));
     }
 
     private static void BackendInitializationGates()
@@ -164,30 +151,31 @@ internal static class Program
         FakeTransport good = new();
         PawnIoArbscBackend backend = CreateBackend(good);
         backend.Initialize();
-        SequenceEqual(ArbscProfile.ChipAddresses, good.ReadBatches[0]);
-        SequenceEqual(ArbscProfile.CurveAddresses, good.ReadBatches[1]);
+        backend.Initialize();
+        SequenceEqual(ArbscProfile.ControllerProfileAddresses, good.ReadBatches[0]);
+        SequenceEqual(ArbscProfile.OwnedAddresses, good.ReadBatches[1]);
+        Equal(2, good.ReadBatches.Count);
+        Equal(0, good.WriteBatches.Count);
         backend.Dispose();
         True(good.Disposed);
 
         FakeTransport wrongChip = new();
-        wrongChip.SetByte(ArbscProfile.ChipAddresses[0], 0);
+        wrongChip.SetByte(ArbscProfile.ControllerProfileAddresses[0], 0);
         PawnIoArbscBackend chipBackend = CreateBackend(wrongChip);
         Throws<PlatformNotSupportedException>(chipBackend.Initialize);
         True(wrongChip.Disposed);
+        Equal(1, wrongChip.ReadBatches.Count);
 
-        FakeTransport wrongCurve = new();
-        wrongCurve.SetByte((ushort)(ArbscProfile.CurveStart + 1), 0);
-        PawnIoArbscBackend curveBackend = CreateBackend(wrongCurve);
-        Throws<InvalidOperationException>(curveBackend.Initialize);
-        True(wrongCurve.Disposed);
+        FakeTransport baselineReadFailure = new();
+        baselineReadFailure.FailReadCalls.Add(2);
+        PawnIoArbscBackend baselineBackend = CreateBackend(baselineReadFailure);
+        Throws<IOException>(baselineBackend.Initialize);
+        True(baselineReadFailure.Disposed);
 
         int transportFactoryCalls = 0;
         FakeTransport unused = new();
         PawnIoArbscBackend wrongHost = new(
-            new FakeHostIdentityReader(new HostIdentity(
-                "Other",
-                ArbscProfile.Product,
-                ArbscProfile.Board)),
+            static () => "Other",
             () =>
             {
                 transportFactoryCalls++;
@@ -222,11 +210,13 @@ internal static class Program
 
         backend.Reset(ArbscFan.Cpu);
         SequenceEqual(
-            ArbscProfile.StockWrites(ArbscFan.Cpu),
+            ArbscProfile.RestoreWrites(ArbscFan.Cpu, transport.InitialBaseline),
             transport.WriteBatches[2]);
         Equal<byte?>(null, backend.CodeFor(ArbscFan.Cpu));
         Equal<byte?>((byte)51, backend.CodeFor(ArbscFan.System));
-        AssertMemory(transport, ArbscProfile.StockWrites(ArbscFan.Cpu));
+        AssertMemory(
+            transport,
+            ArbscProfile.RestoreWrites(ArbscFan.Cpu, transport.InitialBaseline));
         AssertMemory(transport, ArbscProfile.ManualWrites(ArbscFan.System, 51));
 
         backend.Reset(ArbscFan.Cpu);
@@ -240,8 +230,10 @@ internal static class Program
             transport.ReadBatches[^1]);
 
         backend.Dispose();
-        SequenceEqual(ArbscProfile.AllStockWrites(), transport.WriteBatches[^1]);
-        AssertMemory(transport, ArbscProfile.AllStockWrites());
+        SequenceEqual(
+            ArbscProfile.AllRestoreWrites(transport.InitialBaseline),
+            transport.WriteBatches[^1]);
+        AssertMemory(transport, ArbscProfile.AllRestoreWrites(transport.InitialBaseline));
         Equal<byte?>(null, backend.CodeFor(ArbscFan.Cpu));
         Equal<byte?>(null, backend.CodeFor(ArbscFan.System));
         True(transport.Disposed);
@@ -258,7 +250,7 @@ internal static class Program
         Equal(1, offTransport.WriteBatches.Count);
         offBackend.Reset(ArbscFan.Cpu);
         SequenceEqual(
-            ArbscProfile.StockWrites(ArbscFan.Cpu),
+            ArbscProfile.RestoreWrites(ArbscFan.Cpu, offTransport.InitialBaseline),
             offTransport.WriteBatches[1]);
         Equal<byte?>(null, offBackend.CodeFor(ArbscFan.Cpu));
         offBackend.Dispose();
@@ -275,8 +267,12 @@ internal static class Program
         SequenceEqual(
             ArbscProfile.ManualWrites(ArbscFan.Cpu, 31),
             setFailure.WriteBatches[0]);
-        SequenceEqual(ArbscProfile.AllStockWrites(), setFailure.WriteBatches[1]);
-        AssertMemory(setFailure, ArbscProfile.AllStockWrites());
+        SequenceEqual(
+            ArbscProfile.AllRestoreWrites(setFailure.InitialBaseline),
+            setFailure.WriteBatches[1]);
+        AssertMemory(
+            setFailure,
+            ArbscProfile.AllRestoreWrites(setFailure.InitialBaseline));
         Equal<byte?>(null, setBackend.CodeFor(ArbscFan.Cpu));
         Equal<byte?>(null, setBackend.CodeFor(ArbscFan.System));
         setBackend.Dispose();
@@ -290,13 +286,24 @@ internal static class Program
         Throws<IOException>(() => resetBackend.Reset(ArbscFan.Cpu));
         Equal(4, resetFailure.WriteBatches.Count);
         SequenceEqual(
-            ArbscProfile.StockWrites(ArbscFan.Cpu),
+            ArbscProfile.RestoreWrites(ArbscFan.Cpu, resetFailure.InitialBaseline),
             resetFailure.WriteBatches[2]);
-        SequenceEqual(ArbscProfile.AllStockWrites(), resetFailure.WriteBatches[3]);
-        AssertMemory(resetFailure, ArbscProfile.AllStockWrites());
+        SequenceEqual(
+            ArbscProfile.AllRestoreWrites(resetFailure.InitialBaseline),
+            resetFailure.WriteBatches[3]);
+        AssertMemory(
+            resetFailure,
+            ArbscProfile.AllRestoreWrites(resetFailure.InitialBaseline));
         Equal<byte?>(null, resetBackend.CodeFor(ArbscFan.Cpu));
         Equal<byte?>(null, resetBackend.CodeFor(ArbscFan.System));
         resetBackend.Dispose();
+
+        FakeTransport disposeFailure = new();
+        PawnIoArbscBackend disposeBackend = CreateBackend(disposeFailure);
+        disposeBackend.Initialize();
+        disposeFailure.FailWriteCalls.Add(1);
+        Throws<IOException>(disposeBackend.Dispose);
+        True(disposeFailure.Disposed);
     }
 
     private static void PluginLifecycleAndIds()
@@ -538,13 +545,12 @@ internal static class Program
     }
 
     private static PawnIoArbscBackend CreateBackend(FakeTransport transport) => new(
-        new FakeHostIdentityReader(ExactHost()),
+        static () => ArbscProfile.Board,
         () => transport);
 
-    private static HostIdentity ExactHost() => new(
-        ArbscProfile.Manufacturer,
-        ArbscProfile.Product,
-        ArbscProfile.Board);
+    private static byte[] ArbitraryBaseline() => Enumerable.Range(0, 30)
+        .Select(index => (byte)(0x40 + index))
+        .ToArray();
 
     private static void AssertMemory(FakeTransport transport, IEnumerable<EcWrite> writes)
     {
@@ -623,27 +629,24 @@ internal static class Program
         public void Log(string message) => Messages.Add(message);
     }
 
-    private sealed class FakeHostIdentityReader(HostIdentity identity) : IHostIdentityReader
-    {
-        public HostIdentity Read() => identity;
-    }
-
     private sealed class FakeTransport : IArbscTransport
     {
         private readonly Dictionary<ushort, byte> memory = [];
+        private int readCalls;
         private int writeCalls;
 
         internal FakeTransport()
         {
-            for (int index = 0; index < ArbscProfile.StockCurve.Length; index++)
+            InitialBaseline = ArbitraryBaseline();
+            for (int index = 0; index < ArbscProfile.OwnedAddresses.Length; index++)
             {
-                memory[(ushort)(ArbscProfile.CurveStart + index)] =
-                    ArbscProfile.StockCurve[index];
+                memory[ArbscProfile.OwnedAddresses[index]] = InitialBaseline[index];
             }
-            byte[] chip = [0x55, 0x71, 0x07, 0xcb];
-            for (int index = 0; index < chip.Length; index++)
+            for (int index = 0; index < ArbscProfile.ExpectedControllerProfile.Length;
+                index++)
             {
-                memory[ArbscProfile.ChipAddresses[index]] = chip[index];
+                memory[ArbscProfile.ControllerProfileAddresses[index]] =
+                    ArbscProfile.ExpectedControllerProfile[index];
             }
             byte[] telemetry = [0x0b, 0xb8, 0x07, 0x6c, 62, 41];
             for (int index = 0; index < telemetry.Length; index++)
@@ -654,16 +657,25 @@ internal static class Program
 
         internal List<ushort[]> ReadBatches { get; } = [];
 
+        internal byte[] InitialBaseline { get; }
+
         internal List<EcWrite[]> WriteBatches { get; } = [];
 
         internal HashSet<int> FailWriteCalls { get; } = [];
+
+        internal HashSet<int> FailReadCalls { get; } = [];
 
         internal bool Disposed { get; private set; }
 
         public byte[] Read(ushort[] addresses)
         {
             ObjectDisposedException.ThrowIf(Disposed, this);
+            readCalls++;
             ReadBatches.Add((ushort[])addresses.Clone());
+            if (FailReadCalls.Contains(readCalls))
+            {
+                throw new IOException($"Expected fake read failure {readCalls}.");
+            }
             return addresses.Select(ByteAt).ToArray();
         }
 
@@ -741,5 +753,3 @@ internal static class Program
         public void Dispose() => DisposeCalls++;
     }
 }
-
-
