@@ -3,22 +3,31 @@ name: Build and release
 on:
   push:
     branches:
-      - "**"
-    tags:
-      - "v*"
+      - master
   pull_request:
+    branches:
+      - master
+  workflow_dispatch:
+    inputs:
+      version:
+        description: Release version without "v" (for example, 0.1.0)
+        required: true
+        type: string
 
 permissions:
   contents: read
 
 concurrency:
-  group: ${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: true
+  group: ${{ github.workflow }}-${{ github.event_name }}-${{ github.event_name == 'workflow_dispatch' && inputs.version || github.ref }}
+  cancel-in-progress: ${{ github.event_name != 'workflow_dispatch' }}
 
 jobs:
   build:
     name: Build and test
     runs-on: windows-latest
+    outputs:
+      publish_release: ${{ steps.version.outputs.publish_release }}
+      release_version: ${{ steps.version.outputs.release_version }}
 
     steps:
       - name: Check out repository
@@ -54,22 +63,31 @@ jobs:
           "FANCONTROL_DIR=$fanControlDir" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
 
       - name: Select plugin version
+        id: version
         shell: pwsh
         env:
-          REF_NAME: ${{ github.ref_name }}
-          REF_TYPE: ${{ github.ref_type }}
+          EVENT_NAME: ${{ github.event_name }}
+          REQUESTED_VERSION: ${{ inputs.version }}
+          WORKFLOW_REF: ${{ github.ref }}
         run: |
-          if ($env:REF_TYPE -eq "tag") {
-              if ($env:REF_NAME -notmatch '^v(?<version>\d+\.\d+\.\d+)$') {
-                  throw "Release tags must use SemVer syntax such as v1.2.3."
+          if ($env:EVENT_NAME -eq "workflow_dispatch") {
+              if ($env:WORKFLOW_REF -ne "refs/heads/master") {
+                  throw "Releases must run from the master branch."
               }
-              $version = $Matches.version
+              $version = $env:REQUESTED_VERSION.Trim()
+              if ($version -notmatch '^(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)$') {
+                  throw "Version must use X.Y.Z syntax, for example 0.1.0."
+              }
+              $publishRelease = "true"
           }
           else {
               $version = "0.0.0-ci.$env:GITHUB_RUN_NUMBER"
+              $publishRelease = "false"
           }
 
           "PLUGIN_VERSION=$version" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          "publish_release=$publishRelease" | Out-File -FilePath $env:GITHUB_OUTPUT -Encoding utf8 -Append
+          "release_version=$version" | Out-File -FilePath $env:GITHUB_OUTPUT -Encoding utf8 -Append
 
       - name: Build plugin
         shell: pwsh
@@ -90,8 +108,8 @@ jobs:
               "-p:Version=$env:PLUGIN_VERSION" `
               -p:ContinuousIntegrationBuild=true
 
-      - name: Package release assets
-        if: startsWith(github.ref, 'refs/tags/v')
+      - name: Package release
+        if: github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/master' && steps.version.outputs.publish_release == 'true'
         shell: pwsh
         run: |
           $outputDir = Join-Path $env:GITHUB_WORKSPACE "bin\Release\net10.0-windows"
@@ -102,10 +120,8 @@ jobs:
 
           $releaseDir = Join-Path $env:GITHUB_WORKSPACE "release-assets"
           New-Item -ItemType Directory -Path $releaseDir -Force | Out-Null
-          $releaseDll = Join-Path $releaseDir "FanControl.MinisforumM1Pro.dll"
           $releaseZip = Join-Path $releaseDir "FanControl.MinisforumM1Pro.zip"
-          Copy-Item -LiteralPath $sourceDll -Destination $releaseDll
-          Compress-Archive -LiteralPath $releaseDll -DestinationPath $releaseZip -CompressionLevel Optimal
+          Compress-Archive -LiteralPath $sourceDll -DestinationPath $releaseZip -CompressionLevel Optimal
 
           Add-Type -AssemblyName System.IO.Compression.FileSystem
           $archive = [IO.Compression.ZipFile]::OpenRead($releaseZip)
@@ -119,33 +135,27 @@ jobs:
               $archive.Dispose()
           }
 
-          $checksums = @($releaseDll, $releaseZip) | ForEach-Object {
-              $hash = (Get-FileHash -LiteralPath $_ -Algorithm SHA256).Hash.ToLowerInvariant()
-              "$hash  $([IO.Path]::GetFileName($_))"
-          }
-          $checksums | Set-Content -LiteralPath (Join-Path $releaseDir "SHA256SUMS.txt") -Encoding ascii
-
-      - name: Upload release assets
-        if: startsWith(github.ref, 'refs/tags/v')
+      - name: Upload release ZIP
+        if: github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/master' && steps.version.outputs.publish_release == 'true'
         uses: actions/upload-artifact@v7
         with:
-          name: release-assets
-          path: release-assets/*
+          name: release-asset
+          path: release-assets/FanControl.MinisforumM1Pro.zip
           if-no-files-found: error
 
   release:
     name: Publish GitHub release
-    if: startsWith(github.ref, 'refs/tags/v')
+    if: github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/master' && needs.build.outputs.publish_release == 'true'
     needs: build
     runs-on: windows-latest
     permissions:
       contents: write
 
     steps:
-      - name: Download release assets
+      - name: Download release ZIP
         uses: actions/download-artifact@v8
         with:
-          name: release-assets
+          name: release-asset
           path: release-assets
 
       - name: Create GitHub release
@@ -153,16 +163,24 @@ jobs:
         env:
           GH_REPO: ${{ github.repository }}
           GH_TOKEN: ${{ github.token }}
-          RELEASE_TAG: ${{ github.ref_name }}
+          RELEASE_TARGET: ${{ github.sha }}
+          RELEASE_VERSION: ${{ needs.build.outputs.release_version }}
         run: |
-          $assets = Get-ChildItem -LiteralPath .\release-assets -File |
-              Sort-Object Name |
-              ForEach-Object FullName
-          if ($assets.Count -ne 3) {
-              throw "Expected exactly three release assets."
+          $releaseZip = (Get-Item -LiteralPath `
+              .\release-assets\FanControl.MinisforumM1Pro.zip).FullName
+          $releaseTag = "v$env:RELEASE_VERSION"
+          $escapedTag = [Uri]::EscapeDataString($releaseTag)
+          $tagCheck = & gh api `
+              "repos/$env:GH_REPO/git/ref/tags/$escapedTag" `
+              --silent 2>&1
+          if ($LASTEXITCODE -eq 0) {
+              throw "Tag $releaseTag already exists. Choose a new version."
+          }
+          if (($tagCheck | Out-String) -notmatch '404') {
+              throw "Could not verify that tag $releaseTag is unused: $tagCheck"
           }
 
-          gh release create $env:RELEASE_TAG @assets `
-              --verify-tag `
-              --title $env:RELEASE_TAG `
+          gh release create $releaseTag $releaseZip `
+              --target $env:RELEASE_TARGET `
+              --title $releaseTag `
               --generate-notes

@@ -46,8 +46,6 @@ plugin**, select either the release ZIP or
 `bin\Release\net10.0-windows\FanControl.MinisforumM1Pro.dll`. The ZIP contains
 only the plugin DLL; FanControl refreshes its sensors after installation.
 
-Pushes and pull requests build and test on GitHub Actions. Pushing a tag such
-as `v1.2.3` creates a release containing the DLL, ZIP, and SHA-256 checksums.
 
 ## Recovery behavior
 
