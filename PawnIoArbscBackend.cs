@@ -2,25 +2,24 @@ namespace FanControl.MinisforumM1Pro;
 
 internal sealed class PawnIoArbscBackend : IArbscBackend
 {
-    private static readonly byte[] ExpectedChip = [0x55, 0x71, 0x07, 0xcb];
-
     private readonly object sync = new();
-    private readonly IHostIdentityReader hostIdentityReader;
+    private readonly Func<string> boardReader;
     private readonly Func<IArbscTransport> transportFactory;
     private IArbscTransport? transport;
+    private byte[]? baseline;
     private byte? cpuCode;
     private byte? systemCode;
 
     internal PawnIoArbscBackend()
-        : this(new WmiHostIdentityReader(), static () => new PawnIoTransport())
+        : this(HostIdentity.ReadBoard, static () => new PawnIoTransport())
     {
     }
 
     internal PawnIoArbscBackend(
-        IHostIdentityReader hostIdentityReader,
+        Func<string> boardReader,
         Func<IArbscTransport> transportFactory)
     {
-        this.hostIdentityReader = hostIdentityReader;
+        this.boardReader = boardReader;
         this.transportFactory = transportFactory;
     }
 
@@ -40,23 +39,20 @@ internal sealed class PawnIoArbscBackend : IArbscBackend
                 return;
             }
 
-            HostIdentityGate.AssertExact(hostIdentityReader.Read());
+            HostIdentityGate.AssertBoard(boardReader());
             IArbscTransport candidate = transportFactory();
             try
             {
-                if (!candidate.Read(ArbscProfile.ChipAddresses).SequenceEqual(ExpectedChip))
+                if (!candidate.Read(ArbscProfile.ControllerProfileAddresses)
+                        .SequenceEqual(ArbscProfile.ExpectedControllerProfile))
                 {
                     throw new PlatformNotSupportedException(
                         "The live controller is not the M1 Pro ARBSC IT5571 profile.");
                 }
-                if (!candidate.Read(ArbscProfile.CurveAddresses)
-                        .SequenceEqual(ArbscProfile.StockCurve))
-                {
-                    throw new InvalidOperationException(
-                        "The ARBSC fan curve is not stock; reboot before loading the plugin.");
-                }
+                byte[] captured = candidate.Read(ArbscProfile.OwnedAddresses);
 
                 transport = candidate;
+                baseline = captured;
                 cpuCode = null;
                 systemCode = null;
             }
@@ -112,7 +108,7 @@ internal sealed class PawnIoArbscBackend : IArbscBackend
             IArbscTransport active = ActiveTransport();
             try
             {
-                active.Write(ArbscProfile.StockWrites(fan));
+                active.Write(ArbscProfile.RestoreWrites(fan, ActiveBaseline()));
                 SetCode(fan, null);
             }
             catch
@@ -128,7 +124,9 @@ internal sealed class PawnIoArbscBackend : IArbscBackend
         lock (sync)
         {
             IArbscTransport? old = transport;
+            byte[]? restore = baseline;
             transport = null;
+            baseline = null;
             if (old is null)
             {
                 return;
@@ -136,7 +134,9 @@ internal sealed class PawnIoArbscBackend : IArbscBackend
 
             try
             {
-                old.Write(ArbscProfile.AllStockWrites());
+                old.Write(ArbscProfile.AllRestoreWrites(restore ??
+                    throw new InvalidOperationException(
+                        "The ARBSC startup baseline is unavailable.")));
             }
             finally
             {
@@ -149,6 +149,9 @@ internal sealed class PawnIoArbscBackend : IArbscBackend
 
     private IArbscTransport ActiveTransport() => transport ??
         throw new InvalidOperationException("The ARBSC backend is not initialized.");
+
+    private byte[] ActiveBaseline() => baseline ??
+        throw new InvalidOperationException("The ARBSC startup baseline is unavailable.");
 
     private void SetCode(ArbscFan fan, byte? code)
     {
@@ -166,7 +169,7 @@ internal sealed class PawnIoArbscBackend : IArbscBackend
     {
         try
         {
-            active.Write(ArbscProfile.AllStockWrites());
+            active.Write(ArbscProfile.AllRestoreWrites(ActiveBaseline()));
             cpuCode = null;
             systemCode = null;
         }

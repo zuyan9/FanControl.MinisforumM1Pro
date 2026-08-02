@@ -7,7 +7,6 @@
     <Nullable>enable</Nullable>
     <ImplicitUsings>enable</ImplicitUsings>
     <TreatWarningsAsErrors>true</TreatWarningsAsErrors>
-    <GenerateDocumentationFile>true</GenerateDocumentationFile>
     <FanControlDir Condition="'$(FanControlDir)' == ''">C:\Program Files (x86)\FanControl</FanControlDir>
   </PropertyGroup>
 
@@ -17,18 +16,11 @@
       <HintPath>$(FanControlDir)\FanControl.Plugins.dll</HintPath>
       <Private>false</Private>
     </Reference>
-    <Reference Include="System.Management">
-      <HintPath>$(FanControlDir)\System.Management.dll</HintPath>
-      <Private>false</Private>
-    </Reference>
   </ItemGroup>
 
   <Target Name="ValidateFanControlReferences" BeforeTargets="ResolveReferences">
     <Error
       Condition="!Exists('$(FanControlDir)\FanControl.Plugins.dll')"
       Text="FanControl.Plugins.dll was not found. Set FanControlDir to the FanControl installation directory." />
-    <Error
-      Condition="!Exists('$(FanControlDir)\System.Management.dll')"
-      Text="System.Management.dll was not found in FanControlDir." />
   </Target>
 </Project>

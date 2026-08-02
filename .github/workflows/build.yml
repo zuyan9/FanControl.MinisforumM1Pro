@@ -1,0 +1,186 @@
+name: Build and release
+
+on:
+  push:
+    branches:
+      - master
+  pull_request:
+    branches:
+      - master
+  workflow_dispatch:
+    inputs:
+      version:
+        description: Release version without "v" (for example, 0.1.0)
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event_name }}-${{ github.event_name == 'workflow_dispatch' && inputs.version || github.ref }}
+  cancel-in-progress: ${{ github.event_name != 'workflow_dispatch' }}
+
+jobs:
+  build:
+    name: Build and test
+    runs-on: windows-latest
+    outputs:
+      publish_release: ${{ steps.version.outputs.publish_release }}
+      release_version: ${{ steps.version.outputs.release_version }}
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v7
+
+      - name: Set up .NET
+        uses: actions/setup-dotnet@v6
+        with:
+          dotnet-version: 10.0.x
+
+      - name: Download FanControl V272 references
+        shell: pwsh
+        run: |
+          $archive = Join-Path $env:RUNNER_TEMP "FanControl_272_net_10_0.zip"
+          $extractDir = Join-Path $env:RUNNER_TEMP "FanControl_272_net_10_0"
+          $uri = "https://github.com/Rem0o/FanControl.Releases/releases/download/V272/FanControl_272_net_10_0.zip"
+          $expectedHash = "5f84c3514b213ea040051c595f1915d9c75e3b5f1c9d7b9b39353f6bbbcd2b80"
+
+          Invoke-WebRequest -Uri $uri -OutFile $archive
+          $actualHash = (Get-FileHash -LiteralPath $archive -Algorithm SHA256).Hash.ToLowerInvariant()
+          if ($actualHash -ne $expectedHash) {
+              throw "FanControl archive checksum mismatch: $actualHash"
+          }
+
+          Expand-Archive -LiteralPath $archive -DestinationPath $extractDir -Force
+          $pluginApi = Get-ChildItem -LiteralPath $extractDir -Recurse -File -Filter "FanControl.Plugins.dll" |
+              Select-Object -First 1
+          if ($null -eq $pluginApi) {
+              throw "FanControl.Plugins.dll was not found in the verified archive."
+          }
+
+          $fanControlDir = $pluginApi.Directory.FullName
+          "FANCONTROL_DIR=$fanControlDir" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+
+      - name: Select plugin version
+        id: version
+        shell: pwsh
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          REQUESTED_VERSION: ${{ inputs.version }}
+          WORKFLOW_REF: ${{ github.ref }}
+        run: |
+          if ($env:EVENT_NAME -eq "workflow_dispatch") {
+              if ($env:WORKFLOW_REF -ne "refs/heads/master") {
+                  throw "Releases must run from the master branch."
+              }
+              $version = $env:REQUESTED_VERSION.Trim()
+              if ($version -notmatch '^(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)$') {
+                  throw "Version must use X.Y.Z syntax, for example 0.1.0."
+              }
+              $publishRelease = "true"
+          }
+          else {
+              $version = "0.0.0-ci.$env:GITHUB_RUN_NUMBER"
+              $publishRelease = "false"
+          }
+
+          "PLUGIN_VERSION=$version" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          "publish_release=$publishRelease" | Out-File -FilePath $env:GITHUB_OUTPUT -Encoding utf8 -Append
+          "release_version=$version" | Out-File -FilePath $env:GITHUB_OUTPUT -Encoding utf8 -Append
+
+      - name: Build plugin
+        shell: pwsh
+        run: |
+          dotnet build .\FanControl.MinisforumM1Pro.csproj `
+              --configuration Release `
+              "-p:FanControlDir=$env:FANCONTROL_DIR" `
+              "-p:Version=$env:PLUGIN_VERSION" `
+              -p:ContinuousIntegrationBuild=true
+
+      - name: Run hardware-free tests
+        shell: pwsh
+        run: |
+          dotnet run `
+              --project .\tests\FanControl.MinisforumM1Pro.Tests.csproj `
+              --configuration Release `
+              "-p:FanControlDir=$env:FANCONTROL_DIR" `
+              "-p:Version=$env:PLUGIN_VERSION" `
+              -p:ContinuousIntegrationBuild=true
+
+      - name: Package release
+        if: github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/master' && steps.version.outputs.publish_release == 'true'
+        shell: pwsh
+        run: |
+          $outputDir = Join-Path $env:GITHUB_WORKSPACE "bin\Release\net10.0-windows"
+          $sourceDll = Join-Path $outputDir "FanControl.MinisforumM1Pro.dll"
+          if (-not (Test-Path -LiteralPath $sourceDll)) {
+              throw "Built plugin DLL was not found: $sourceDll"
+          }
+
+          $releaseDir = Join-Path $env:GITHUB_WORKSPACE "release-assets"
+          New-Item -ItemType Directory -Path $releaseDir -Force | Out-Null
+          $releaseZip = Join-Path $releaseDir "FanControl.MinisforumM1Pro.zip"
+          Compress-Archive -LiteralPath $sourceDll -DestinationPath $releaseZip -CompressionLevel Optimal
+
+          Add-Type -AssemblyName System.IO.Compression.FileSystem
+          $archive = [IO.Compression.ZipFile]::OpenRead($releaseZip)
+          try {
+              $entries = @($archive.Entries)
+              if ($entries.Count -ne 1 -or $entries[0].FullName -ne "FanControl.MinisforumM1Pro.dll") {
+                  throw "Release ZIP must contain only the plugin DLL at its root."
+              }
+          }
+          finally {
+              $archive.Dispose()
+          }
+
+      - name: Upload release ZIP
+        if: github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/master' && steps.version.outputs.publish_release == 'true'
+        uses: actions/upload-artifact@v7
+        with:
+          name: release-asset
+          path: release-assets/FanControl.MinisforumM1Pro.zip
+          if-no-files-found: error
+
+  release:
+    name: Publish GitHub release
+    if: github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/master' && needs.build.outputs.publish_release == 'true'
+    needs: build
+    runs-on: windows-latest
+    permissions:
+      contents: write
+
+    steps:
+      - name: Download release ZIP
+        uses: actions/download-artifact@v8
+        with:
+          name: release-asset
+          path: release-assets
+
+      - name: Create GitHub release
+        shell: pwsh
+        env:
+          GH_REPO: ${{ github.repository }}
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TARGET: ${{ github.sha }}
+          RELEASE_VERSION: ${{ needs.build.outputs.release_version }}
+        run: |
+          $releaseZip = (Get-Item -LiteralPath `
+              .\release-assets\FanControl.MinisforumM1Pro.zip).FullName
+          $releaseTag = "v$env:RELEASE_VERSION"
+          $escapedTag = [Uri]::EscapeDataString($releaseTag)
+          $tagCheck = & gh api `
+              "repos/$env:GH_REPO/git/ref/tags/$escapedTag" `
+              --silent 2>&1
+          if ($LASTEXITCODE -eq 0) {
+              throw "Tag $releaseTag already exists. Choose a new version."
+          }
+          if (($tagCheck | Out-String) -notmatch '404') {
+              throw "Could not verify that tag $releaseTag is unused: $tagCheck"
+          }
+
+          gh release create $releaseTag $releaseZip `
+              --target $env:RELEASE_TARGET `
+              --title $releaseTag `
+              --generate-notes

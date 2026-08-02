@@ -10,15 +10,15 @@ FanControl's PawnIO stack and exposes:
 
 ## Compatibility
 
-The plugin loads only when all of these checks pass:
+The plugin loads only when both checks pass:
 
-- manufacturer `Micro Computer (HK) Tech Limited`;
-- product `AI Series` and board `ARBSC`;
-- live IT5571 signature `55 71 07 cb`;
-- the complete expected stock fan curve.
+- Windows reports baseboard `ARBSC`;
+- the live IT5571 controller profile is `55 71 07 cb`.
 
 It was developed on board revision 1.0, BIOS 1.01, and FanControl V272. Other
-Minisforum models are not supported.
+Minisforum models are not supported. At initialization, the plugin captures
+the current 30 fan base/slope bytes. This preserves whichever firmware fan
+mode is active instead of requiring one hard-coded factory curve.
 
 ## Control behavior
 
@@ -41,14 +41,16 @@ dotnet build -c Release
 dotnet run --project .\tests\FanControl.MinisforumM1Pro.Tests.csproj -c Release
 ```
 
-Close FanControl and install
-`bin\Release\net10.0-windows\FanControl.MinisforumM1Pro.dll` using
-**Settings > Plugins > Install plugin**, or copy it into FanControl's
-`Plugins` directory. Start FanControl as administrator and refresh sensors.
+Start FanControl as administrator. Under **Settings > Plugins > Install
+plugin**, select either the release ZIP or
+`bin\Release\net10.0-windows\FanControl.MinisforumM1Pro.dll`. The ZIP contains
+only the plugin DLL; FanControl refreshes its sensors after installation.
+
 
 ## Recovery behavior
 
-Disabling a control restores that fan's stock automatic curve. A normal plugin
-refresh or FanControl exit restores both fans. Force-terminating FanControl can
-leave manual control active; if the plugin refuses to reload because the curve
-is not stock, reboot before trying again.
+Disabling a control restores that fan's values captured at initialization. A
+normal plugin refresh or FanControl exit restores both fans. Force-terminating
+FanControl can leave manual values active. Restart Windows before reopening
+FanControl when recovering from a forced termination; firmware startup restores
+its configured fan mode.

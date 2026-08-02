@@ -16,9 +16,5 @@
       <HintPath>$(FanControlDir)\FanControl.Plugins.dll</HintPath>
       <Private>true</Private>
     </Reference>
-    <Reference Include="System.Management">
-      <HintPath>$(FanControlDir)\System.Management.dll</HintPath>
-      <Private>true</Private>
-    </Reference>
   </ItemGroup>
 </Project>
