@@ -2,73 +2,105 @@ using FanControl.Plugins;
 
 namespace FanControl.MinisforumM1Pro;
 
-/// <summary>Exposes ARBSC fan telemetry and controls to FanControl.</summary>
+/// <summary>Exposes supported Minisforum M1 fan telemetry and controls.</summary>
 public sealed class M1ProPlugin : IPlugin2
 {
-    private readonly Func<IArbscBackend> backendFactory;
+    private readonly M1ModelProfile profile;
+    private readonly Func<string> boardReader;
+    private readonly Func<M1ModelProfile, IM1Backend> backendFactory;
     private readonly IPluginLogger? logger;
-    private readonly Sensor cpuFan = new(
-        "minisforum.m1pro.arbsc.fan1",
-        "M1 Pro CPU Fan");
-    private readonly Sensor systemFan = new(
-        "minisforum.m1pro.arbsc.fan2",
-        "M1 Pro System Fan");
-    private readonly Sensor cpuTemperature = new(
-        "minisforum.m1pro.arbsc.cpu-temperature",
-        "M1 Pro EC CPU Temperature");
-    private readonly Sensor systemTemperature = new(
-        "minisforum.m1pro.arbsc.system-temperature",
-        "M1 Pro EC System Temperature");
+    private readonly Sensor cpuFan;
+    private readonly Sensor systemFan;
+    private readonly Sensor cpuTemperature;
+    private readonly Sensor systemTemperature;
     private readonly ControlSensor cpuControl;
     private readonly ControlSensor systemControl;
-    private IArbscBackend? backend;
+    private IM1Backend? backend;
+    private bool recoveryFailed;
 
     /// <summary>Creates the plugin with the native PawnIO backend.</summary>
     public M1ProPlugin()
-        : this(static () => new PawnIoArbscBackend(), null)
+        : this(DetectProfile(), null)
     {
     }
 
     /// <summary>Creates the plugin with FanControl logging.</summary>
     public M1ProPlugin(IPluginLogger logger)
-        : this(static () => new PawnIoArbscBackend(), logger)
+        : this(DetectProfile(), logger)
+    {
+    }
+
+    private M1ProPlugin(M1ModelProfile profile, IPluginLogger? logger)
+        : this(
+            profile,
+            HostIdentity.ReadBoard,
+            static selected => new PawnIoM1Backend(selected),
+            logger)
     {
     }
 
     internal M1ProPlugin(
-        Func<IArbscBackend> backendFactory,
+        M1ModelProfile profile,
+        Func<string> boardReader,
+        Func<M1ModelProfile, IM1Backend> backendFactory,
         IPluginLogger? logger = null)
     {
-        this.backendFactory = backendFactory;
+        this.profile = profile ?? throw new ArgumentNullException(nameof(profile));
+        this.boardReader = boardReader ?? throw new ArgumentNullException(nameof(boardReader));
+        this.backendFactory = backendFactory ??
+            throw new ArgumentNullException(nameof(backendFactory));
         this.logger = logger;
+
+        string prefix = profile.SensorIdPrefix;
+        cpuFan = new Sensor($"{prefix}.fan1", $"{profile.ModelName} CPU Fan");
+        systemFan = new Sensor($"{prefix}.fan2", $"{profile.ModelName} System Fan");
+        cpuTemperature = new Sensor(
+            $"{prefix}.cpu-temperature",
+            $"{profile.ModelName} EC CPU Temperature");
+        systemTemperature = new Sensor(
+            $"{prefix}.system-temperature",
+            $"{profile.ModelName} EC System Temperature");
         cpuControl = new ControlSensor(
-            "minisforum.m1pro.arbsc.cpu-control",
-            "M1 Pro CPU Fan Control",
+            $"{prefix}.cpu-control",
+            $"{profile.ModelName} CPU Fan Control",
             $"{Name}/{cpuFan.Id}",
-            value => Set(ArbscFan.Cpu, value),
-            () => Reset(ArbscFan.Cpu));
+            value => Set(M1Fan.Cpu, value),
+            () => Reset(M1Fan.Cpu));
         systemControl = new ControlSensor(
-            "minisforum.m1pro.arbsc.system-control",
-            "M1 Pro System Fan Control",
+            $"{prefix}.system-control",
+            $"{profile.ModelName} System Fan Control",
             $"{Name}/{systemFan.Id}",
-            value => Set(ArbscFan.System, value),
-            () => Reset(ArbscFan.System));
+            value => Set(M1Fan.System, value),
+            () => Reset(M1Fan.System));
     }
 
     /// <inheritdoc />
-    public string Name => "Minisforum M1 Pro (ARBSC)";
+    public string Name => profile.PluginName;
 
     /// <inheritdoc />
     public void Initialize()
     {
         Close();
-        IArbscBackend candidate = backendFactory();
+        if (recoveryFailed)
+        {
+            throw new InvalidOperationException(
+                $"{profile.ModelName} baseline restoration previously failed. " +
+                "Restart Windows before reinitializing the plugin.");
+        }
+        HostIdentityGate.AssertBoard(profile, boardReader());
+        IM1Backend candidate = backendFactory(profile);
         try
         {
             candidate.Initialize();
             Apply(candidate.ReadTelemetry());
             backend = candidate;
-            Log("Minisforum M1 Pro lean ARBSC backend initialized.");
+            Log($"{profile.ModelName} {profile.Board} backend initialized.");
+            if (!profile.HardwareValidated)
+            {
+                Log(
+                    $"{profile.ModelName} support is analysis-derived and experimental; " +
+                    "its transport and physical control range have not been validated on hardware.");
+            }
         }
         catch
         {
@@ -83,7 +115,7 @@ public sealed class M1ProPlugin : IPlugin2
         container.FanSensors.AddRange([cpuFan, systemFan]);
         container.TempSensors.AddRange([cpuTemperature, systemTemperature]);
         container.ControlSensors.AddRange([cpuControl, systemControl]);
-        Log("Minisforum M1 Pro loaded paired CPU and system fan controls.");
+        Log($"{profile.ModelName} loaded paired CPU and system fan controls.");
     }
 
     /// <inheritdoc />
@@ -91,7 +123,7 @@ public sealed class M1ProPlugin : IPlugin2
     {
         try
         {
-            IArbscBackend? active = Volatile.Read(ref backend);
+            IM1Backend? active = Volatile.Read(ref backend);
             if (active is not null)
             {
                 Apply(active.ReadTelemetry());
@@ -99,7 +131,7 @@ public sealed class M1ProPlugin : IPlugin2
         }
         catch (Exception exception)
         {
-            Log($"Minisforum M1 Pro telemetry read failed: {exception.Message}");
+            Log($"{profile.ModelName} telemetry read failed: {exception.Message}");
         }
     }
 
@@ -108,7 +140,7 @@ public sealed class M1ProPlugin : IPlugin2
     {
         cpuControl.Clear();
         systemControl.Clear();
-        IArbscBackend? old = Interlocked.Exchange(ref backend, null);
+        IM1Backend? old = Interlocked.Exchange(ref backend, null);
         if (old is null)
         {
             return;
@@ -120,25 +152,49 @@ public sealed class M1ProPlugin : IPlugin2
         }
         catch (Exception exception)
         {
-            Log($"Minisforum M1 Pro baseline restoration failed: {exception.Message}");
+            recoveryFailed = true;
+            Log($"{profile.ModelName} baseline restoration failed: {exception.Message}");
+            Log($"Restart Windows before reinitializing {profile.ModelName}.");
         }
     }
 
-    private byte Set(ArbscFan fan, float percentage)
+    private float Set(M1Fan fan, float percentage)
     {
-        byte requestedCode = ArbscProfile.ToCode(percentage);
-        (Volatile.Read(ref backend) ??
-            throw new InvalidOperationException("The ARBSC backend is unavailable."))
-            .Set(fan, ArbscProfile.NormalizeCode(requestedCode));
-        return requestedCode;
+        FanControlRequest request = profile.Policy(fan).Resolve(percentage);
+        try
+        {
+            (Volatile.Read(ref backend) ??
+                throw new InvalidOperationException(
+                    $"The {profile.ModelName} backend is unavailable."))
+                .Set(fan, request.AppliedCode);
+        }
+        catch
+        {
+            cpuControl.Clear();
+            systemControl.Clear();
+            throw;
+        }
+        return request.ReportedPercentage;
     }
 
-    private void Reset(ArbscFan fan) => Volatile.Read(ref backend)?.Reset(fan);
-
-    private void Apply(ArbscTelemetry telemetry)
+    private void Reset(M1Fan fan)
     {
-        cpuFan.Value = telemetry.Fan1Rpm;
-        systemFan.Value = telemetry.Fan2Rpm;
+        try
+        {
+            Volatile.Read(ref backend)?.Reset(fan);
+        }
+        catch
+        {
+            cpuControl.Clear();
+            systemControl.Clear();
+            throw;
+        }
+    }
+
+    private void Apply(M1Telemetry telemetry)
+    {
+        cpuFan.Value = telemetry.CpuFanRpm;
+        systemFan.Value = telemetry.SystemFanRpm;
         cpuTemperature.Value = telemetry.CpuTemperatureC;
         systemTemperature.Value = telemetry.SystemTemperatureC;
     }
@@ -151,6 +207,20 @@ public sealed class M1ProPlugin : IPlugin2
         }
         catch
         {
+        }
+    }
+
+    private static M1ModelProfile DetectProfile()
+    {
+        try
+        {
+            return M1ModelProfiles.TryResolveExact(HostIdentity.ReadBoard()) ??
+                M1ModelProfiles.M1Pro;
+        }
+        catch
+        {
+            // Preserve the legacy plugin identity until Initialize can report the host gate.
+            return M1ModelProfiles.M1Pro;
         }
     }
 
@@ -171,7 +241,7 @@ public sealed class M1ProPlugin : IPlugin2
         string id,
         string name,
         string pairedFanSensorId,
-        Func<float, byte> set,
+        Func<float, float> set,
         Action reset) : IPluginControlSensor2
     {
         public string Id { get; } = id;
@@ -184,7 +254,7 @@ public sealed class M1ProPlugin : IPlugin2
 
         public void Set(float value)
         {
-            Value = ArbscProfile.ToPercentage(set(value));
+            Value = set(value);
         }
 
         public void Reset()
