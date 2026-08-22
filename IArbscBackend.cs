@@ -1,12 +1,12 @@
 namespace FanControl.MinisforumM1Pro;
 
-internal interface IArbscBackend : IDisposable
+internal interface IM1Backend : IDisposable
 {
     void Initialize();
 
-    ArbscTelemetry ReadTelemetry();
+    M1Telemetry ReadTelemetry();
 
-    void Set(ArbscFan fan, byte code);
+    void Set(M1Fan fan, byte code);
 
-    void Reset(ArbscFan fan);
+    void Reset(M1Fan fan);
 }

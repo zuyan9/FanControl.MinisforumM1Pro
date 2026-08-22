@@ -5,28 +5,66 @@ namespace FanControl.MinisforumM1Pro;
 
 internal readonly record struct EcWrite(ushort Address, byte Value);
 
-internal interface IArbscTransport : IDisposable
+internal interface IPawnIoExecutor : IDisposable
+{
+    void OpenAndLoad(byte[] module);
+
+    ulong[] Execute(string name, ulong[] input, int outputCount);
+}
+
+internal interface IM1TransportAccess
 {
     byte[] Read(ushort[] addresses);
 
     void Write(EcWrite[] writes);
 }
 
-internal sealed class PawnIoTransport : IArbscTransport
+internal interface IM1Transport : IDisposable
 {
-    private readonly Mutex isaMutex = new(false, ArbscProfile.IsaMutexName);
-    private readonly PawnIoNative native;
+    byte[] ReadOuterIdentity();
 
-    internal PawnIoTransport()
+    T RunExclusive<T>(Func<IM1TransportAccess, T> action);
+}
+
+internal sealed class PawnIoTransport : IM1Transport
+{
+    private readonly Mutex isaMutex = new(false, M1EcLayout.IsaMutexName);
+    private readonly IPawnIoExecutor native;
+    private readonly byte slot;
+    private readonly ulong outerIndexPort;
+    private readonly SelectedAccess selectedAccess;
+
+    internal PawnIoTransport(byte slot)
+        : this(slot, CreateResources())
     {
-        string pawnIoPath = Path.Combine(
-            Environment.GetFolderPath(Environment.SpecialFolder.ProgramFiles),
-            "PawnIO",
-            "PawnIOLib.dll");
-        native = new PawnIoNative(pawnIoPath);
+    }
+
+    private PawnIoTransport(
+        byte slot,
+        (IPawnIoExecutor Native, byte[] Module) resources)
+        : this(slot, resources.Native, resources.Module)
+    {
+    }
+
+    internal PawnIoTransport(
+        byte slot,
+        IPawnIoExecutor native,
+        byte[] module)
+    {
+        this.native = native ?? throw new ArgumentNullException(nameof(native));
         try
         {
-            native.OpenAndLoad(LoadLpcModule());
+            if (slot > 1)
+            {
+                throw new ArgumentOutOfRangeException(
+                    nameof(slot),
+                    "PawnIO slot must be 0 or 1.");
+            }
+            ArgumentNullException.ThrowIfNull(module);
+            this.slot = slot;
+            outerIndexPort = slot == 0 ? 0x2eUL : 0x4eUL;
+            selectedAccess = new SelectedAccess(this);
+            native.OpenAndLoad(module);
         }
         catch
         {
@@ -36,44 +74,73 @@ internal sealed class PawnIoTransport : IArbscTransport
         }
     }
 
-    public byte[] Read(ushort[] addresses) => RunIsa(() =>
+    public T RunExclusive<T>(Func<IM1TransportAccess, T> action)
     {
-        SelectSlot();
+        ArgumentNullException.ThrowIfNull(action);
+        return RunIsa(() =>
+        {
+            bool selected = false;
+            try
+            {
+                SelectSlot();
+                selected = true;
+                return action(selectedAccess);
+            }
+            finally
+            {
+                if (selected)
+                {
+                    Park();
+                }
+                else
+                {
+                    ParkOuterIndex();
+                }
+            }
+        });
+    }
+
+    public byte[] ReadOuterIdentity() => RunIsa(() =>
+    {
         try
         {
-            byte[] values = new byte[addresses.Length];
-            for (int index = 0; index < addresses.Length; index++)
+            SelectSlot();
+            return new[]
             {
-                SetAddress(addresses[index]);
-                Out(0x2e, 0x12);
-                values[index] = checked((byte)In(0x2f));
-            }
-            return values;
+                checked((byte)In(0x20)),
+                checked((byte)In(0x21)),
+                checked((byte)In(0x22)),
+            };
         }
         finally
         {
-            Park();
+            ParkOuterIndex();
         }
     });
 
-    public void Write(EcWrite[] writes) => RunIsa(() =>
+    private byte[] ReadSelected(ushort[] addresses)
     {
-        SelectSlot();
-        try
+        ArgumentNullException.ThrowIfNull(addresses);
+        byte[] values = new byte[addresses.Length];
+        for (int index = 0; index < addresses.Length; index++)
         {
-            foreach (EcWrite write in writes)
-            {
-                SetAddress(write.Address);
-                Out(0x2e, 0x12);
-                Out(0x2f, write.Value);
-            }
+            SetAddress(addresses[index]);
+            Out(0x2e, 0x12);
+            values[index] = checked((byte)In(0x2f));
         }
-        finally
+        return values;
+    }
+
+    private void WriteSelected(EcWrite[] writes)
+    {
+        ArgumentNullException.ThrowIfNull(writes);
+        foreach (EcWrite write in writes)
         {
-            Park();
+            SetAddress(write.Address);
+            Out(0x2e, 0x12);
+            Out(0x2f, write.Value);
         }
-        return 0;
-    });
+    }
 
     public void Dispose()
     {
@@ -110,7 +177,7 @@ internal sealed class PawnIoTransport : IArbscTransport
         }
     }
 
-    private void SelectSlot() => native.Execute("ioctl_select_slot", [1], 0);
+    private void SelectSlot() => native.Execute("ioctl_select_slot", [slot], 0);
 
     private void SetAddress(ushort address)
     {
@@ -128,15 +195,48 @@ internal sealed class PawnIoTransport : IArbscTransport
         }
         finally
         {
-            native.Execute("ioctl_pio_outb", [0x4e, 0x20], 0);
+            ParkOuterIndex();
         }
     }
+
+    private void ParkOuterIndex() =>
+        native.Execute("ioctl_pio_outb", [outerIndexPort, 0x20], 0);
 
     private ulong In(ulong port) =>
         native.Execute("ioctl_superio_inb", [port], 1)[0];
 
     private void Out(ulong port, ulong value) =>
         native.Execute("ioctl_superio_outb", [port, value], 0);
+
+    private sealed class SelectedAccess(PawnIoTransport owner) : IM1TransportAccess
+    {
+        public byte[] Read(ushort[] addresses) => owner.ReadSelected(addresses);
+
+        public void Write(EcWrite[] writes) => owner.WriteSelected(writes);
+    }
+
+    private static PawnIoNative CreateNative()
+    {
+        string pawnIoPath = Path.Combine(
+            Environment.GetFolderPath(Environment.SpecialFolder.ProgramFiles),
+            "PawnIO",
+            "PawnIOLib.dll");
+        return new PawnIoNative(pawnIoPath);
+    }
+
+    private static (IPawnIoExecutor Native, byte[] Module) CreateResources()
+    {
+        IPawnIoExecutor native = CreateNative();
+        try
+        {
+            return (native, LoadLpcModule());
+        }
+        catch
+        {
+            native.Dispose();
+            throw;
+        }
+    }
 
     private static byte[] LoadLpcModule()
     {
@@ -151,15 +251,15 @@ internal sealed class PawnIoTransport : IArbscTransport
             .FirstOrDefault(item => item.GetName().Name == "LibreHardwareMonitorLib") ??
             Assembly.LoadFrom(path);
         using Stream stream = assembly.GetManifestResourceStream(
-            ArbscProfile.LpcResourceName) ?? throw new InvalidOperationException(
-                $"PawnIO resource was not found: {ArbscProfile.LpcResourceName}");
+            M1EcLayout.LpcResourceName) ?? throw new InvalidOperationException(
+                $"PawnIO resource was not found: {M1EcLayout.LpcResourceName}");
         byte[] module = new byte[checked((int)stream.Length)];
         stream.ReadExactly(module);
         return module;
     }
 }
 
-internal sealed class PawnIoNative : IDisposable
+internal sealed class PawnIoNative : IPawnIoExecutor
 {
     [UnmanagedFunctionPointer(CallingConvention.StdCall)]
     private delegate int OpenDelegate(out IntPtr handle);
@@ -205,7 +305,7 @@ internal sealed class PawnIoNative : IDisposable
         }
     }
 
-    internal void OpenAndLoad(byte[] module)
+    public void OpenAndLoad(byte[] module)
     {
         Check(open(out handle), "pawnio_open");
         if (handle == IntPtr.Zero)
@@ -224,7 +324,7 @@ internal sealed class PawnIoNative : IDisposable
         }
     }
 
-    internal ulong[] Execute(string name, ulong[] input, int outputCount)
+    public ulong[] Execute(string name, ulong[] input, int outputCount)
     {
         ulong[] output = new ulong[outputCount];
         Check(

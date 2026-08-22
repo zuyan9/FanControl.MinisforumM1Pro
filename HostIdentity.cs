@@ -13,12 +13,13 @@ internal static class HostIdentity
 
 internal static class HostIdentityGate
 {
-    internal static void AssertBoard(string board)
+    internal static void AssertBoard(M1ModelProfile profile, string board)
     {
-        if (!string.Equals(board, ArbscProfile.Board, StringComparison.Ordinal))
+        ArgumentNullException.ThrowIfNull(profile);
+        if (!string.Equals(board, profile.Board, StringComparison.Ordinal))
         {
             throw new PlatformNotSupportedException(
-                $"Expected baseboard {ArbscProfile.Board}; found {board}.");
+                $"Expected baseboard {profile.Board} for {profile.ModelName}; found {board}.");
         }
     }
 }
