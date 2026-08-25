@@ -141,6 +141,7 @@ public sealed class M1ProPlugin : IPlugin2
     {
         cpuControl.Clear();
         systemControl.Clear();
+        ClearTelemetry();
         IM1Backend? old = Interlocked.Exchange(ref backend, null);
         if (old is null)
         {
@@ -171,8 +172,7 @@ public sealed class M1ProPlugin : IPlugin2
         }
         catch
         {
-            cpuControl.Clear();
-            systemControl.Clear();
+            Close();
             throw;
         }
         return request.ReportedPercentage;
@@ -186,8 +186,7 @@ public sealed class M1ProPlugin : IPlugin2
         }
         catch
         {
-            cpuControl.Clear();
-            systemControl.Clear();
+            Close();
             throw;
         }
     }

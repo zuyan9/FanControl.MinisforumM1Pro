@@ -97,6 +97,10 @@ Disabling a control restores that fan's captured startup values. A normal
 plugin refresh or FanControl exit restores both modified channels. Closing the
 plugin without ever enabling a control performs no EC data write.
 
+Any Set or Reset failure closes the backend and attempts a verified full
+baseline restoration. If restoration fails, restart Windows before the plugin
+can be initialized again.
+
 Force-terminating FanControl can leave manual values active. Restart Windows
 before reopening FanControl after a forced termination. M1 Lite startup also
 requires an exact stock curve, so it intentionally refuses a stale manual
