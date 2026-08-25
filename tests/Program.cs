@@ -22,6 +22,7 @@ internal static class Program
             ("M1 Lite successful transactions", M1LiteSuccessfulTransactions),
             ("backend verified recovery", BackendVerifiedRecovery),
             ("backend ownership drift", BackendOwnershipDrift),
+            ("plugin control failure shutdown", PluginControlFailureShutdown),
             ("M1 Pro plugin compatibility", M1ProPluginCompatibility),
             ("M1 Lite plugin metadata and controls", M1LitePluginMetadataAndControls),
             ("plugin gates and lifecycle failures", PluginGatesAndLifecycleFailures),
@@ -773,6 +774,21 @@ internal static class Program
         Equal(4, retryFailure.WriteBatches.Count);
         SequenceEqual(retryBaseline, retryFailure.CurveSnapshot());
 
+        FakeTransport combinedFailure = FakeTransport.ForProfile(pro, 1, 0x07);
+        byte[] combinedBaseline = combinedFailure.CurveSnapshot();
+        PawnIoM1Backend combinedBackend = CreateBackend(pro, combinedFailure);
+        combinedBackend.Initialize();
+        combinedFailure.FailWriteAfterCounts[1] = 3;
+        combinedFailure.FailWriteAfterCounts[2] = 1;
+        Throws<IOException>(() => combinedBackend.Set(M1Fan.Cpu, 20));
+        True(combinedBackend.NeedsRestore);
+        False(combinedFailure.CurveSnapshot().SequenceEqual(combinedBaseline));
+        combinedFailure.FailWriteAfterCounts[3] = 1;
+        combinedBackend.Dispose();
+        Equal(4, combinedFailure.WriteBatches.Count);
+        SequenceEqual(combinedBaseline, combinedFailure.CurveSnapshot());
+        True(combinedFailure.Disposed);
+
         FakeTransport partialSet = FakeTransport.ForProfile(pro, 1, 0x07);
         byte[] partialBaseline = partialSet.CurveSnapshot();
         PawnIoM1Backend partialBackend = CreateBackend(pro, partialSet);
@@ -855,6 +871,88 @@ internal static class Program
         True(ownedDrift.Disposed);
     }
 
+    private static void PluginControlFailureShutdown()
+    {
+        M1ModelProfile profile = M1ModelProfiles.M1Pro;
+        FakeTransport transport = FakeTransport.ForProfile(profile, 1, 0x07);
+        byte[] baseline = transport.CurveSnapshot();
+        PawnIoM1Backend backend = CreateBackend(profile, transport);
+        FakeLogger logger = new();
+        M1ProPlugin plugin = new(
+            profile,
+            () => profile.Board,
+            _ => backend,
+            logger);
+        FakeContainer container = new();
+
+        try
+        {
+            plugin.Initialize();
+            plugin.Load(container);
+            IPluginControlSensor2 cpu = FindControl(
+                container,
+                "minisforum.m1pro.arbsc.cpu-control");
+            IPluginControlSensor2 system = FindControl(
+                container,
+                "minisforum.m1pro.arbsc.system-control");
+            transport.FailExclusiveCleanupCalls.Add(transport.ExclusiveCalls + 1);
+
+            Throws<IOException>(() => cpu.Set(50f));
+            Equal<float?>(null, cpu.Value);
+            Equal<float?>(null, system.Value);
+            Equal<float?>(null, FindFan(container, profile, "fan1").Value);
+            Equal<float?>(null, FindFan(container, profile, "fan2").Value);
+            Equal<float?>(null, FindTemperature(
+                container,
+                profile,
+                "cpu-temperature").Value);
+            Equal<float?>(null, FindTemperature(
+                container,
+                profile,
+                "system-temperature").Value);
+            Equal(2, transport.WriteBatches.Count);
+            SequenceEqual(baseline, transport.CurveSnapshot());
+            True(transport.Disposed);
+            False(logger.Messages.Any(message => message.Contains("Restart Windows")));
+
+            int writes = transport.WriteBatches.Count;
+            Throws<InvalidOperationException>(() => system.Set(50f));
+            Equal(writes, transport.WriteBatches.Count);
+        }
+        finally
+        {
+            plugin.Close();
+        }
+
+        FakeBackend failedRestoration = new(new M1Telemetry(3_000, 1_900, 60, 40))
+        {
+            DisposeException = new InvalidOperationException(
+                "expected restoration failure"),
+        };
+        failedRestoration.FailSetCalls.Add(1);
+        FakeLogger failedLogger = new();
+        M1ProPlugin failedPlugin = CreatePlugin(profile, failedRestoration, failedLogger);
+        FakeContainer failedContainer = new();
+        try
+        {
+            failedPlugin.Initialize();
+            failedPlugin.Load(failedContainer);
+            IPluginControlSensor2 cpu = FindControl(
+                failedContainer,
+                "minisforum.m1pro.arbsc.cpu-control");
+            IOException setFailure = Throws<IOException>(() => cpu.Set(50f));
+            Equal("Expected fake set failure 1.", setFailure.Message);
+            Equal(1, failedRestoration.DisposeCalls);
+            True(failedLogger.Messages.Any(message => message.Contains("Restart Windows")));
+            Throws<InvalidOperationException>(failedPlugin.Initialize);
+            Equal(1, failedRestoration.InitializeCalls);
+        }
+        finally
+        {
+            failedPlugin.Close();
+        }
+    }
+
     private static void M1ProPluginCompatibility()
     {
         M1ModelProfile profile = M1ModelProfiles.M1Pro;
@@ -903,6 +1001,7 @@ internal static class Program
             Throws<IOException>(cpu.Reset);
             Equal<float?>(null, cpu.Value);
             Equal<float?>(null, system.Value);
+            Equal(1, backend.DisposeCalls);
         }
         finally
         {
@@ -960,6 +1059,7 @@ internal static class Program
             Throws<IOException>(() => system.Set(50f));
             Equal<float?>(null, cpu.Value);
             Equal<float?>(null, system.Value);
+            Equal(1, backend.DisposeCalls);
 
             int calls = backend.SetCalls.Count;
             Throws<ArgumentOutOfRangeException>(() => cpu.Set(float.NaN));
@@ -969,7 +1069,7 @@ internal static class Program
             True(logger.Messages.Any(message => message.Contains("experimental")));
 
             system.Reset();
-            SequenceEqual([M1Fan.System], backend.ResetCalls);
+            SequenceEqual<M1Fan>([], backend.ResetCalls);
             Equal<float?>(null, system.Value);
         }
         finally
@@ -1368,6 +1468,10 @@ internal static class Program
 
         internal HashSet<int> FailReadCalls { get; } = [];
 
+        internal HashSet<int> FailExclusiveCleanupCalls { get; } = [];
+
+        internal int ExclusiveCalls { get; private set; }
+
         internal bool Disposed { get; private set; }
 
         internal static FakeTransport WrongController(byte slot) =>
@@ -1413,7 +1517,14 @@ internal static class Program
         public T RunExclusive<T>(Func<IM1TransportAccess, T> action)
         {
             ObjectDisposedException.ThrowIf(Disposed, this);
-            return action(this);
+            ExclusiveCalls++;
+            T result = action(this);
+            if (FailExclusiveCleanupCalls.Contains(ExclusiveCalls))
+            {
+                throw new IOException(
+                    $"Expected exclusive cleanup failure {ExclusiveCalls}.");
+            }
+            return result;
         }
 
         public byte[] Read(ushort[] addresses)

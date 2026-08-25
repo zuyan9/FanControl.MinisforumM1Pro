@@ -533,7 +533,7 @@ internal sealed class PawnIoM1Backend : IM1Backend
         }
         catch
         {
-            if (!TryRestoreAfterFailure(active, previous, ActiveBaselineCurve()))
+            if (!TryRestoreAfterFailure(active, previous, attempted))
             {
                 throw;
             }
