@@ -28,8 +28,11 @@ Do not run another EC-writing or fan-control utility at the same time.
 
 | Model | Required board | Firmware/runtime gate | Status |
 |---|---|---|---|
-| M1 Pro | `ARBSC` | outer/native controller `55 71 07`, exact `0x200d = 0xcb`, exact known stock curve | Hardware-validated on board revision 1.0, BIOS 1.01 |
+| M1 Pro | `ARBSC` | outer/native controller `55 71 07`, exact `0x200d = 0xcb`, and one of two exact known stock curve tables | Hardware-validated on board revision 1.0, BIOS 1.01 |
 | M1 Lite | `MTBSI` | exact EC 0.02 build identity, read/write controller mode, and one of two exact stock curve tables | Derived from BIOS/EC analysis; no live hardware validation |
+
+The internal curve selector maps `0xb0` and `0xb2` to the normal table and
+`0xb1` to the alternate table. These values are not named BIOS power profiles.
 
 M1 Lite support is deliberately experimental. Static analysis proves that its
 EC firmware implements the same two-channel curve engine, control addresses,
@@ -57,12 +60,17 @@ exposes the complete `0..51` FanControl scale for both channels, including
 System off. CPU codes `1..17`, System codes `0..9`, and System codes `42..51`
 remain hardware-unvalidated; raw byte values above 51 are not exposed.
 
-At startup the plugin captures only the 30 curve base/slope bytes it may own.
-It writes slopes before bases for manual control, verifies the full 64-byte
-curve state after every transaction, and restores bases before slopes. The
-ownership check, write, readback, and any bounded recovery run under one ISA
-mutex acquisition. Any unresolved mode, threshold, owned-byte, identity, or
-readback mismatch stops further writes.
+At startup the plugin captures and verifies the full 64-byte curve block.
+Manual control owns, modifies, and restores only its 30 base/slope bytes. It
+writes slopes before bases, verifies the full block after every transaction,
+and restores bases before slopes. Ownership checks, writes, readbacks, and any
+bounded recovery all run under one ISA mutex acquisition. Any unresolved mode,
+threshold, owned-byte, identity, or readback mismatch stops further writes.
+
+Manual control replaces the OEM temperature-dependent curve, including its
+high-temperature fan escalation. If you want a guard, configure a curve from a
+reliable CPU-package sensor and combine it with your regular curve using
+FanControl's Max Mix.
 
 Run FanControl calibration for both paired controls after installation. For
 M1 Lite, calibrate one channel at a time with direct temperature and acoustic
