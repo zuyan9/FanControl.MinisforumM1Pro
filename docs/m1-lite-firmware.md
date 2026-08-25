@@ -151,9 +151,9 @@ the unused eighth system row.
 ## Exact stock curves
 
 Mode byte `0x032e` has three statically observed values. `0xb0` and `0xb2`
-share the normal table; `0xb1` selects the alternate table. Their marketing
-names are unknown, so the plugin does not label the modes Silent, Balanced, or
-Performance.
+share the normal table; `0xb1` selects the alternate table. Their relationship
+to user-facing BIOS power-profile names is not established, so the plugin uses
+only the neutral normal and alternate labels.
 
 Each tuple is `(base code, upper temperature, lower temperature, slope)`.
 

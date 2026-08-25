@@ -56,10 +56,10 @@ public sealed class M1ProPlugin : IPlugin2
         systemFan = new Sensor($"{prefix}.fan2", $"{profile.ModelName} System Fan");
         cpuTemperature = new Sensor(
             $"{prefix}.cpu-temperature",
-            $"{profile.ModelName} EC CPU Temperature");
+            $"{profile.ModelName} EC CPU");
         systemTemperature = new Sensor(
             $"{prefix}.system-temperature",
-            $"{profile.ModelName} EC System Temperature");
+            $"{profile.ModelName} EC System");
         cpuControl = new ControlSensor(
             $"{prefix}.cpu-control",
             $"{profile.ModelName} CPU Fan Control",
@@ -131,6 +131,7 @@ public sealed class M1ProPlugin : IPlugin2
         }
         catch (Exception exception)
         {
+            ClearTelemetry();
             Log($"{profile.ModelName} telemetry read failed: {exception.Message}");
         }
     }
@@ -197,6 +198,14 @@ public sealed class M1ProPlugin : IPlugin2
         systemFan.Value = telemetry.SystemFanRpm;
         cpuTemperature.Value = telemetry.CpuTemperatureC;
         systemTemperature.Value = telemetry.SystemTemperatureC;
+    }
+
+    private void ClearTelemetry()
+    {
+        cpuFan.Value = null;
+        systemFan.Value = null;
+        cpuTemperature.Value = null;
+        systemTemperature.Value = null;
     }
 
     private void Log(string message)

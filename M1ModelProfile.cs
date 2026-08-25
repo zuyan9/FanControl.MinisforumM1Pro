@@ -175,7 +175,7 @@ internal sealed class M1ModelProfile
         }
         if ((this.normalCurve is null) != (this.alternateCurve is null))
         {
-            throw new ArgumentException("Both MTBSI curve variants must be supplied together.");
+            throw new ArgumentException("Both known curve variants must be supplied together.");
         }
         if (this.normalCurve is not null &&
             (this.normalCurve.Length != M1EcLayout.CurveBlockLength ||
@@ -392,7 +392,7 @@ internal sealed class M1ModelProfile
 
 internal static class M1ModelProfiles
 {
-    private static readonly byte[] MtbsiNormalCurve =
+    private static readonly byte[] KnownNormalCurve =
     [
         0, 25, 0, 18, 45, 25, 22, 54, 45, 28, 66, 54,
         33, 80, 66, 37, 92, 80, 40, 96, 92, 51, 100, 96,
@@ -403,7 +403,7 @@ internal static class M1ModelProfiles
         0, 17, 58, 0, 0, 0, 0, 0,
     ];
 
-    private static readonly byte[] MtbsiAlternateCurve =
+    private static readonly byte[] KnownAlternateCurve =
     [
         0, 25, 0, 18, 45, 25, 22, 54, 45, 25, 72, 54,
         28, 80, 72, 32, 89, 80, 34, 93, 89, 51, 100, 93,
@@ -443,8 +443,8 @@ internal static class M1ModelProfiles
         [
             new EcExpectation(0x200d, 0xcb),
         ],
-        normalCurve: MtbsiNormalCurve,
-        alternateCurve: MtbsiAlternateCurve);
+        normalCurve: KnownNormalCurve,
+        alternateCurve: KnownAlternateCurve);
 
     internal static readonly M1ModelProfile M1Lite = new(
         key: "m1lite-mtbsi",
@@ -457,8 +457,8 @@ internal static class M1ModelProfiles
         systemPolicy: M1LitePolicy,
         candidateSlots: [1, 0],
         startupProbe: MtbsiStartupProbe(),
-        normalCurve: MtbsiNormalCurve,
-        alternateCurve: MtbsiAlternateCurve,
+        normalCurve: KnownNormalCurve,
+        alternateCurve: KnownAlternateCurve,
         validateTelemetry: true,
         validateTargets: true);
 

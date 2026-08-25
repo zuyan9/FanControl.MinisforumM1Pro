@@ -12,7 +12,7 @@ internal static class Program
             ("exact model resolution", ExactModelResolution),
             ("controller identity policies", ControllerIdentityPolicies),
             ("model-specific control policies", ModelSpecificControlPolicies),
-            ("MTBSI firmware fingerprints", MtbsiFirmwareFingerprints),
+            ("known firmware curve fingerprints", KnownFirmwareCurveFingerprints),
             ("shared curve ownership layout", SharedCurveOwnershipLayout),
             ("telemetry decoding", TelemetryDecoding),
             ("PawnIO native slot sequences", PawnIoNativeSlotSequences),
@@ -25,7 +25,9 @@ internal static class Program
             ("M1 Pro plugin compatibility", M1ProPluginCompatibility),
             ("M1 Lite plugin metadata and controls", M1LitePluginMetadataAndControls),
             ("plugin gates and lifecycle failures", PluginGatesAndLifecycleFailures),
-            ("plugin update error retention", PluginUpdateErrorRetention),
+            (
+                "plugin telemetry invalidation and recovery",
+                PluginTelemetryInvalidationAndRecovery),
         ];
 
         int failures = 0;
@@ -126,8 +128,9 @@ internal static class Program
         Throws<ArgumentOutOfRangeException>(() => liteSystem.AssertCode(52));
     }
 
-    private static void MtbsiFirmwareFingerprints()
+    private static void KnownFirmwareCurveFingerprints()
     {
+        M1ModelProfile pro = M1ModelProfiles.M1Pro;
         M1ModelProfile lite = M1ModelProfiles.M1Lite;
         byte[] normal = lite.StockCurve(0xb0) ?? throw new InvalidOperationException();
         byte[] alternate = lite.StockCurve(0xb1) ?? throw new InvalidOperationException();
@@ -144,6 +147,15 @@ internal static class Program
         True(lite.MatchesCurve(0xb1, alternate));
         False(lite.MatchesCurve(0xb1, normal));
         False(lite.MatchesCurve(0xaf, normal));
+        SequenceEqual(
+            normal,
+            pro.StockCurve(0xb0) ?? throw new InvalidOperationException());
+        SequenceEqual(
+            normal,
+            pro.StockCurve(0xb2) ?? throw new InvalidOperationException());
+        SequenceEqual(
+            alternate,
+            pro.StockCurve(0xb1) ?? throw new InvalidOperationException());
         normal[0] ^= 1;
         False(lite.MatchesCurve(0xb0, normal));
 
@@ -569,52 +581,17 @@ internal static class Program
     private static void BackendTransactionsAndBounds()
     {
         M1ModelProfile pro = M1ModelProfiles.M1Pro;
-        foreach (byte stockMode in new byte[] { 0xb1, 0xb2 })
-        {
-            FakeTransport stockTransport = FakeTransport.ForProfile(pro, 1, 0x07);
-            stockTransport.SetStockMode(stockMode);
-            PawnIoM1Backend stockBackend = CreateBackend(pro, stockTransport);
-            stockBackend.Initialize();
-            stockBackend.Dispose();
-            Equal(0, stockTransport.WriteBatches.Count);
-        }
+        AssertProLifecycle(0xb0);
+        AssertProLifecycle(0xb1);
 
-        FakeTransport transport = FakeTransport.ForProfile(pro, 1, 0x07);
-        byte[] baselineCurve = transport.CurveSnapshot();
-        byte[] baselineOwned = M1EcLayout.CaptureOwned(baselineCurve);
-        PawnIoM1Backend backend = CreateBackend(pro, transport);
-        backend.Initialize();
-        Equal(0, transport.WriteBatches.Count);
-        False(backend.NeedsRestore);
-
-        backend.Set(M1Fan.Cpu, 13);
-        Equal<byte?>((byte)13, backend.CodeFor(M1Fan.Cpu));
-        SequenceEqual(M1EcLayout.ManualWrites(M1Fan.Cpu, 13), transport.WriteBatches[0]);
-        True(backend.NeedsRestore);
-        backend.Set(M1Fan.Cpu, 13);
-        Equal(1, transport.WriteBatches.Count);
-
-        backend.Set(M1Fan.System, 51);
-        Equal<byte?>((byte)51, backend.CodeFor(M1Fan.System));
-        SequenceEqual(M1EcLayout.ManualWrites(M1Fan.System, 51), transport.WriteBatches[1]);
-
-        backend.Reset(M1Fan.Cpu);
-        SequenceEqual(
-            M1EcLayout.RestoreWrites(M1Fan.Cpu, baselineOwned),
-            transport.WriteBatches[2]);
-        Equal<byte?>(null, backend.CodeFor(M1Fan.Cpu));
-        True(backend.NeedsRestore);
-
-        M1Telemetry telemetry = backend.ReadTelemetry();
-        Equal(3_000, telemetry.CpuFanRpm);
-        Equal(1_900, telemetry.SystemFanRpm);
-
-        backend.Dispose();
-        SequenceEqual(
-            M1EcLayout.AllRestoreWrites(baselineOwned),
-            transport.WriteBatches[3]);
-        SequenceEqual(baselineCurve, transport.CurveSnapshot());
-        True(transport.Disposed);
+        FakeTransport thirdSelector = FakeTransport.ForProfile(pro, 1, 0x07);
+        thirdSelector.SetStockMode(0xb2);
+        PawnIoM1Backend thirdSelectorBackend = CreateBackend(
+            pro,
+            thirdSelector);
+        thirdSelectorBackend.Initialize();
+        thirdSelectorBackend.Dispose();
+        Equal(0, thirdSelector.WriteBatches.Count);
 
         FakeTransport noOpTransport = FakeTransport.ForProfile(pro, 1, 0x07);
         PawnIoM1Backend noOp = CreateBackend(pro, noOpTransport);
@@ -653,6 +630,52 @@ internal static class Program
         Throws<ArgumentOutOfRangeException>(() => liteBackend.Set(M1Fan.System, 52));
         Equal(0, liteTransport.WriteBatches.Count);
         liteBackend.Dispose();
+    }
+
+    private static void AssertProLifecycle(byte stockMode)
+    {
+        M1ModelProfile pro = M1ModelProfiles.M1Pro;
+        FakeTransport transport = FakeTransport.ForProfile(pro, 1, 0x07);
+        transport.SetStockMode(stockMode);
+        byte[] baselineCurve = transport.CurveSnapshot();
+        byte[] baselineOwned = M1EcLayout.CaptureOwned(baselineCurve);
+        PawnIoM1Backend backend = CreateBackend(pro, transport);
+        backend.Initialize();
+        Equal(0, transport.WriteBatches.Count);
+        False(backend.NeedsRestore);
+
+        backend.Set(M1Fan.Cpu, 13);
+        Equal<byte?>((byte)13, backend.CodeFor(M1Fan.Cpu));
+        SequenceEqual(
+            M1EcLayout.ManualWrites(M1Fan.Cpu, 13),
+            transport.WriteBatches[0]);
+        True(backend.NeedsRestore);
+        backend.Set(M1Fan.Cpu, 13);
+        Equal(1, transport.WriteBatches.Count);
+
+        backend.Set(M1Fan.System, 51);
+        Equal<byte?>((byte)51, backend.CodeFor(M1Fan.System));
+        SequenceEqual(
+            M1EcLayout.ManualWrites(M1Fan.System, 51),
+            transport.WriteBatches[1]);
+
+        backend.Reset(M1Fan.Cpu);
+        SequenceEqual(
+            M1EcLayout.RestoreWrites(M1Fan.Cpu, baselineOwned),
+            transport.WriteBatches[2]);
+        Equal<byte?>(null, backend.CodeFor(M1Fan.Cpu));
+        True(backend.NeedsRestore);
+
+        M1Telemetry telemetry = backend.ReadTelemetry();
+        Equal(3_000, telemetry.CpuFanRpm);
+        Equal(1_900, telemetry.SystemFanRpm);
+
+        backend.Dispose();
+        SequenceEqual(
+            M1EcLayout.AllRestoreWrites(baselineOwned),
+            transport.WriteBatches[3]);
+        SequenceEqual(baselineCurve, transport.CurveSnapshot());
+        True(transport.Disposed);
     }
 
     private static void M1LiteSuccessfulTransactions()
@@ -1000,7 +1023,7 @@ internal static class Program
         True(logger.Messages.Any(message => message.Contains("Restart Windows")));
     }
 
-    private static void PluginUpdateErrorRetention()
+    private static void PluginTelemetryInvalidationAndRecovery()
     {
         M1ModelProfile profile = M1ModelProfiles.M1Lite;
         FakeBackend backend = new(
@@ -1022,13 +1045,27 @@ internal static class Program
             float? confirmed = cpu.Value;
 
             plugin.Update();
-            Equal<float?>(2_800f, FindFan(container, profile, "fan1").Value);
+            Equal<float?>(null, FindFan(container, profile, "fan1").Value);
+            Equal<float?>(null, FindFan(container, profile, "fan2").Value);
+            Equal<float?>(null, FindTemperature(
+                container,
+                profile,
+                "cpu-temperature").Value);
+            Equal<float?>(null, FindTemperature(
+                container,
+                profile,
+                "system-temperature").Value);
             Equal(confirmed, cpu.Value);
             True(logger.Messages.Any(message =>
                 message.Contains("telemetry read failed", StringComparison.Ordinal)));
 
             plugin.Update();
             Equal<float?>(2_900f, FindFan(container, profile, "fan1").Value);
+            Equal<float?>(1_800f, FindFan(container, profile, "fan2").Value);
+            Equal<float?>(61f, FindTemperature(
+                container,
+                profile,
+                "cpu-temperature").Value);
             Equal<float?>(40f, FindTemperature(
                 container,
                 profile,
@@ -1097,8 +1134,8 @@ internal static class Program
             container.ControlSensors.Select(sensor => sensor.Id));
         Equal($"{model} CPU Fan", container.FanSensors[0].Name);
         Equal($"{model} System Fan", container.FanSensors[1].Name);
-        Equal($"{model} EC CPU Temperature", container.TempSensors[0].Name);
-        Equal($"{model} EC System Temperature", container.TempSensors[1].Name);
+        Equal($"{model} EC CPU", container.TempSensors[0].Name);
+        Equal($"{model} EC System", container.TempSensors[1].Name);
 
         IPluginControlSensor2 cpu = (IPluginControlSensor2)container.ControlSensors[0];
         IPluginControlSensor2 system = (IPluginControlSensor2)container.ControlSensors[1];
@@ -1295,13 +1332,18 @@ internal static class Program
     private sealed class FakeTransport : IM1Transport, IM1TransportAccess
     {
         private readonly Dictionary<ushort, byte> memory = [];
+        private readonly M1ModelProfile? profile;
         private int readCalls;
         private int writeCalls;
 
-        private FakeTransport(byte slot, byte[] outerIdentity)
+        private FakeTransport(
+            byte slot,
+            byte[] outerIdentity,
+            M1ModelProfile? profile = null)
         {
             Slot = slot;
             OuterIdentity = outerIdentity;
+            this.profile = profile;
         }
 
         internal byte Slot { get; }
@@ -1336,11 +1378,11 @@ internal static class Program
             byte slot,
             byte revision)
         {
-            FakeTransport result = new(slot, [0x55, 0x71, revision]);
+            FakeTransport result = new(slot, [0x55, 0x71, revision], profile);
             result.SetBytes(0x2000, [0x55, 0x71, revision]);
             result.SetByte(0x200d, 0xcb);
             result.SetByte(M1EcLayout.ModeAddress, 0xb0);
-            byte[] curve = M1ModelProfiles.M1Lite.StockCurve(0xb0) ??
+            byte[] curve = profile.StockCurve(0xb0) ??
                 throw new InvalidOperationException();
             result.SetBytes(M1EcLayout.CurveBlockStart, curve);
             result.SetBytes(0x0420, [0x00, 0x00, 0x03, 0xe8]);
@@ -1436,7 +1478,7 @@ internal static class Program
 
         internal void SetStockMode(byte mode)
         {
-            byte[] curve = M1ModelProfiles.M1Lite.StockCurve(mode) ??
+            byte[] curve = profile?.StockCurve(mode) ??
                 throw new ArgumentOutOfRangeException(nameof(mode));
             SetByte(M1EcLayout.ModeAddress, mode);
             SetBytes(M1EcLayout.CurveBlockStart, curve);
