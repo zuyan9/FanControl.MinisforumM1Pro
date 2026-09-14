@@ -8,12 +8,12 @@ through FanControl's PawnIO stack and exposes:
 - CPU and system policy temperature from the EC;
 - paired CPU and system fan controls.
 
-The assembly, DLL, project, and public plugin class retain the M1 Pro name for
-release compatibility. The plugin selects the model from the exact Windows
-baseboard product.
+> [!TIP]
+> Checkout [FanControl.MinisforumUM](https://github.com/zuyan9/FanControl.MinisforumUM)
+> for fan control on UM series, such as UM780 and UM690.
 
-<img width="650" alt="M1 Pro FanControl sensors" src="https://github.com/user-attachments/assets/f02dcb36-28c6-4523-bc50-71c186b99fe3" />
-<img width="350" alt="M1 Pro FanControl controls" src="https://github.com/user-attachments/assets/6e94fff1-f59f-429b-8265-fdc747283ac9" />
+<img width="400" alt="M1 Pro FanControl sensors" src="https://github.com/user-attachments/assets/f02dcb36-28c6-4523-bc50-71c186b99fe3" />
+<img width="300" alt="M1 Pro FanControl controls" src="https://github.com/user-attachments/assets/6e94fff1-f59f-429b-8265-fdc747283ac9" />
 
 ## Install
 
