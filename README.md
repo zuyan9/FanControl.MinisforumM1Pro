@@ -22,6 +22,13 @@ Download the latest plugin
 start FanControl, then install the DLL under **Settings > Plugins > Install
 plugin...**. FanControl refreshes its sensors after installation.
 
+To upgrade, exit FanControl, replace
+`Plugins\MinisforumM1Pro\FanControl.MinisforumM1Pro.dll` in the FanControl
+directory with the new release's DLL, and start FanControl again. **Install
+plugin...** does not overwrite an installed copy, and FanControl loads every
+copy it finds under `Plugins`, so do not leave other copies in that folder or
+its subfolders.
+
 Do not run another EC-writing or fan-control utility at the same time.
 
 ## Compatibility and evidence
@@ -107,3 +114,23 @@ requires an exact stock curve, so it intentionally refuses a stale manual
 curve until firmware startup has restored it. M1 Pro also requires one of the
 two known stock tables, preventing a partial crash-left curve from becoming a
 new baseline.
+
+## Troubleshooting
+
+**"Failed to load plugin ... Make sure the plugin's dll is unblocked in its
+properties."** FanControl shows this for any `FileLoadException`, not only for
+blocked files. For this plugin it usually means FanControl found two copies of
+`FanControl.MinisforumM1Pro.dll` with different versions, for example an older
+copy placed directly in `Plugins`. FanControl searches every subfolder of
+`Plugins`, keeps running the copy it loaded first, and rejects the other one.
+`log.txt` in the FanControl directory then shows `Assembly with same name is
+already loaded`. Unblocking the file does not help. Exit FanControl, delete
+every copy except `Plugins\MinisforumM1Pro\FanControl.MinisforumM1Pro.dll`,
+make sure that copy is the latest release, and start FanControl again. This
+PowerShell command lists every DLL that FanControl tries to load as a plugin,
+with its assembly version:
+
+```powershell
+Get-ChildItem "C:\Program Files (x86)\FanControl\Plugins" -Recurse -Filter "FanControl*.dll" |
+    ForEach-Object { "{0}  {1}" -f [Reflection.AssemblyName]::GetAssemblyName($_.FullName), $_.FullName }
+```
