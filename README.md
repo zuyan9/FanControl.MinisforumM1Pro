@@ -89,7 +89,7 @@ dotnet run --project .\tests\FanControl.MinisforumM1Pro.Tests.csproj -c Release
 The console harness is hardware-free. It covers both profiles, controller-slot
 discovery and native port sequencing, all startup gates and hysteresis boundary
 samples, policy bounds, model metadata, write ordering, readback, ownership
-drift, and verified recovery.
+drift, verified recovery, and failure containment.
 
 ## Recovery behavior
 
@@ -98,8 +98,12 @@ plugin refresh or FanControl exit restores both modified channels. Closing the
 plugin without ever enabling a control performs no EC data write.
 
 Any Set or Reset failure closes the backend and attempts a verified full
-baseline restoration. If restoration fails, restart Windows before the plugin
-can be initialized again.
+baseline restoration. The plugin logs the failure instead of throwing it to
+FanControl, which would otherwise stop updating every other fan and sensor.
+The plugin's controls then stay idle until FanControl is refreshed. An invalid
+command, such as NaN from a broken curve, returns that fan to the firmware
+curve. If restoration fails, restart Windows before the plugin can be
+initialized again.
 
 Force-terminating FanControl can leave manual values active. Restart Windows
 before reopening FanControl after a forced termination. M1 Lite startup also

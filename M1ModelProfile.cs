@@ -51,9 +51,12 @@ internal sealed class FanControlPolicy
 
     internal ReportedCodeMode ReportedCodeMode { get; }
 
+    internal static bool IsValidPercentage(float percentage) =>
+        float.IsFinite(percentage) && percentage is >= 0f and <= 100f;
+
     internal FanControlRequest Resolve(float percentage)
     {
-        if (!float.IsFinite(percentage) || percentage < 0f || percentage > 100f)
+        if (!IsValidPercentage(percentage))
         {
             throw new ArgumentOutOfRangeException(
                 nameof(percentage),

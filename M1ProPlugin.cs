@@ -160,36 +160,82 @@ public sealed class M1ProPlugin : IPlugin2
         }
     }
 
-    private float Set(M1Fan fan, float percentage)
+    private float? Set(M1Fan fan, float percentage)
     {
+        if (!FanControlPolicy.IsValidPercentage(percentage))
+        {
+            // FanControl clamps commands but passes NaN from a broken curve through.
+            if (ControlFor(fan).Value is not null)
+            {
+                Log($"{ControlFor(fan).Name} received invalid command {percentage}; " +
+                    "returning the fan to the firmware curve.");
+            }
+            Reset(fan);
+            return null;
+        }
+
+        IM1Backend? active = Volatile.Read(ref backend);
+        if (active is null)
+        {
+            return null;
+        }
+
         FanControlRequest request = profile.Policy(fan).Resolve(percentage);
         try
         {
-            (Volatile.Read(ref backend) ??
-                throw new InvalidOperationException(
-                    $"The {profile.ModelName} backend is unavailable."))
-                .Set(fan, request.AppliedCode);
+            active.Set(fan, request.AppliedCode);
         }
-        catch
+        catch (Exception exception)
         {
-            Close();
-            throw;
+            Fail(fan, active, exception);
+            return null;
         }
         return request.ReportedPercentage;
     }
 
     private void Reset(M1Fan fan)
     {
+        IM1Backend? active = Volatile.Read(ref backend);
+        if (active is null)
+        {
+            return;
+        }
+
         try
         {
-            Volatile.Read(ref backend)?.Reset(fan);
+            active.Reset(fan);
         }
-        catch
+        catch (Exception exception)
         {
-            Close();
-            throw;
+            Fail(fan, active, exception);
         }
     }
+
+    // FanControl calls Set and Reset from loops without per-control error handling, so
+    // an escaping exception would stop every other control and provider; contain it here.
+    private void Fail(M1Fan fan, IM1Backend failed, Exception exception)
+    {
+        if (!ReferenceEquals(Volatile.Read(ref backend), failed))
+        {
+            // A concurrent Close already restored the firmware curve.
+            return;
+        }
+
+        Log($"{ControlFor(fan).Name} failed: {exception.Message}");
+        Close();
+        if (!recoveryFailed)
+        {
+            Log($"{profile.ModelName} fans returned to the firmware curve. " +
+                "Refresh FanControl to resume control.");
+        }
+    }
+
+    private ControlSensor ControlFor(M1Fan fan) => fan switch
+    {
+        M1Fan.Cpu => cpuControl,
+        M1Fan.System => systemControl,
+        _ => throw new ArgumentOutOfRangeException(nameof(fan)),
+    };
 
     private void Apply(M1Telemetry telemetry)
     {
@@ -249,7 +295,7 @@ public sealed class M1ProPlugin : IPlugin2
         string id,
         string name,
         string pairedFanSensorId,
-        Func<float, float> set,
+        Func<float, float?> set,
         Action reset) : IPluginControlSensor2
     {
         public string Id { get; } = id;

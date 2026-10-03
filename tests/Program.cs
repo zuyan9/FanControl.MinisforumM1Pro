@@ -25,6 +25,7 @@ internal static class Program
             ("plugin control failure shutdown", PluginControlFailureShutdown),
             ("M1 Pro plugin compatibility", M1ProPluginCompatibility),
             ("M1 Lite plugin metadata and controls", M1LitePluginMetadataAndControls),
+            ("plugin invalid commands", PluginInvalidCommands),
             ("plugin gates and lifecycle failures", PluginGatesAndLifecycleFailures),
             (
                 "plugin telemetry invalidation and recovery",
@@ -897,7 +898,7 @@ internal static class Program
                 "minisforum.m1pro.arbsc.system-control");
             transport.FailExclusiveCleanupCalls.Add(transport.ExclusiveCalls + 1);
 
-            Throws<IOException>(() => cpu.Set(50f));
+            cpu.Set(50f);
             Equal<float?>(null, cpu.Value);
             Equal<float?>(null, system.Value);
             Equal<float?>(null, FindFan(container, profile, "fan1").Value);
@@ -913,11 +914,20 @@ internal static class Program
             Equal(2, transport.WriteBatches.Count);
             SequenceEqual(baseline, transport.CurveSnapshot());
             True(transport.Disposed);
+            True(logger.Messages.Any(message => message.Contains(
+                "M1 Pro CPU Fan Control failed: Expected exclusive cleanup failure")));
+            True(logger.Messages.Any(message => message.Contains("Refresh FanControl")));
             False(logger.Messages.Any(message => message.Contains("Restart Windows")));
 
             int writes = transport.WriteBatches.Count;
-            Throws<InvalidOperationException>(() => system.Set(50f));
+            int logged = logger.Messages.Count;
+            system.Set(50f);
+            cpu.Set(float.NaN);
+            system.Reset();
             Equal(writes, transport.WriteBatches.Count);
+            Equal(logged, logger.Messages.Count);
+            Equal<float?>(null, cpu.Value);
+            Equal<float?>(null, system.Value);
         }
         finally
         {
@@ -940,16 +950,43 @@ internal static class Program
             IPluginControlSensor2 cpu = FindControl(
                 failedContainer,
                 "minisforum.m1pro.arbsc.cpu-control");
-            IOException setFailure = Throws<IOException>(() => cpu.Set(50f));
-            Equal("Expected fake set failure 1.", setFailure.Message);
+            cpu.Set(50f);
+            Equal<float?>(null, cpu.Value);
             Equal(1, failedRestoration.DisposeCalls);
+            True(failedLogger.Messages.Any(message =>
+                message.Contains("failed: Expected fake set failure 1.")));
             True(failedLogger.Messages.Any(message => message.Contains("Restart Windows")));
+            False(failedLogger.Messages.Any(message => message.Contains("Refresh FanControl")));
             Throws<InvalidOperationException>(failedPlugin.Initialize);
             Equal(1, failedRestoration.InitializeCalls);
         }
         finally
         {
             failedPlugin.Close();
+        }
+
+        FakeBackend racing = new(new M1Telemetry(3_000, 1_900, 60, 40));
+        racing.FailSetCalls.Add(1);
+        FakeLogger racingLogger = new();
+        M1ProPlugin racingPlugin = CreatePlugin(profile, racing, racingLogger);
+        FakeContainer racingContainer = new();
+        try
+        {
+            racingPlugin.Initialize();
+            racingPlugin.Load(racingContainer);
+            racing.BeforeSet = racingPlugin.Close;
+            IPluginControlSensor2 cpu = FindControl(
+                racingContainer,
+                "minisforum.m1pro.arbsc.cpu-control");
+            cpu.Set(50f);
+            Equal<float?>(null, cpu.Value);
+            Equal(1, racing.DisposeCalls);
+            False(racingLogger.Messages.Any(message => message.Contains("failed")));
+            False(racingLogger.Messages.Any(message => message.Contains("Refresh FanControl")));
+        }
+        finally
+        {
+            racingPlugin.Close();
         }
     }
 
@@ -998,10 +1035,12 @@ internal static class Program
             False(logger.Messages.Any(message => message.Contains("experimental")));
 
             backend.FailResetCalls.Add(1);
-            Throws<IOException>(cpu.Reset);
+            cpu.Reset();
             Equal<float?>(null, cpu.Value);
             Equal<float?>(null, system.Value);
             Equal(1, backend.DisposeCalls);
+            True(logger.Messages.Any(message => message.Contains(
+                "M1 Pro CPU Fan Control failed: Expected fake reset failure 1.")));
         }
         finally
         {
@@ -1056,21 +1095,77 @@ internal static class Program
             Equal<float?>(100f, system.Value);
 
             backend.FailSetCalls.Add(5);
-            Throws<IOException>(() => system.Set(50f));
+            system.Set(50f);
             Equal<float?>(null, cpu.Value);
             Equal<float?>(null, system.Value);
             Equal(1, backend.DisposeCalls);
+            True(logger.Messages.Any(message => message.Contains(
+                "M1 Lite System Fan Control failed: Expected fake set failure 5.")));
 
             int calls = backend.SetCalls.Count;
-            Throws<ArgumentOutOfRangeException>(() => cpu.Set(float.NaN));
-            Throws<ArgumentOutOfRangeException>(() => system.Set(-1f));
+            int logged = logger.Messages.Count;
+            cpu.Set(100f);
+            cpu.Set(float.NaN);
+            system.Set(-1f);
             Equal(calls, backend.SetCalls.Count);
+            Equal(logged, logger.Messages.Count);
             Equal<float?>(null, cpu.Value);
             True(logger.Messages.Any(message => message.Contains("experimental")));
 
             system.Reset();
             SequenceEqual<M1Fan>([], backend.ResetCalls);
             Equal<float?>(null, system.Value);
+        }
+        finally
+        {
+            plugin.Close();
+        }
+    }
+
+    private static void PluginInvalidCommands()
+    {
+        M1ModelProfile profile = M1ModelProfiles.M1Pro;
+        FakeBackend backend = new(new M1Telemetry(3_000, 1_900, 60, 40));
+        FakeLogger logger = new();
+        M1ProPlugin plugin = CreatePlugin(profile, backend, logger);
+        FakeContainer container = new();
+
+        try
+        {
+            plugin.Initialize();
+            plugin.Load(container);
+            IPluginControlSensor2 cpu = FindControl(
+                container,
+                "minisforum.m1pro.arbsc.cpu-control");
+            IPluginControlSensor2 system = FindControl(
+                container,
+                "minisforum.m1pro.arbsc.system-control");
+
+            cpu.Set(50f);
+            system.Set(50f);
+            cpu.Set(float.NaN);
+            Equal<float?>(null, cpu.Value);
+            Equal<float?>(26 * 100f / 51f, system.Value);
+            SequenceEqual([M1Fan.Cpu], backend.ResetCalls);
+
+            cpu.Set(float.PositiveInfinity);
+            cpu.Set(-0.01f);
+            Equal(1, logger.Messages.Count(message => message.Contains(
+                "M1 Pro CPU Fan Control received invalid command NaN")));
+
+            cpu.Set(100f);
+            Equal<float?>(100f, cpu.Value);
+            cpu.Set(100.01f);
+            Equal<float?>(null, cpu.Value);
+            Equal(2, logger.Messages.Count(message => message.Contains("invalid command")));
+            True(backend.ResetCalls.All(fan => fan == M1Fan.Cpu));
+            SequenceEqual(
+                [(M1Fan.Cpu, (byte)26), (M1Fan.System, (byte)26), (M1Fan.Cpu, (byte)51)],
+                backend.SetCalls);
+            Equal(0, backend.DisposeCalls);
+
+            plugin.Update();
+            Equal<float?>(3_000f, FindFan(container, profile, "fan1").Value);
         }
         finally
         {
@@ -1621,6 +1716,8 @@ internal static class Program
 
         internal Exception? DisposeException { get; init; }
 
+        internal Action? BeforeSet { get; set; }
+
         internal HashSet<int> FailReadCalls { get; } = [];
 
         internal HashSet<int> FailSetCalls { get; } = [];
@@ -1662,6 +1759,7 @@ internal static class Program
 
         public void Set(M1Fan fan, byte code)
         {
+            BeforeSet?.Invoke();
             int call = SetCalls.Count + 1;
             if (FailSetCalls.Contains(call))
             {
