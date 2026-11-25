@@ -22,14 +22,21 @@ Download the latest plugin
 start FanControl, then install the DLL under **Settings > Plugins > Install
 plugin...**. FanControl refreshes its sensors after installation.
 
+To upgrade, exit FanControl, replace
+`Plugins\MinisforumM1Pro\FanControl.MinisforumM1Pro.dll` in the FanControl
+directory with the new release's DLL, and start FanControl again. **Install
+plugin...** does not overwrite an installed copy, and FanControl loads every
+copy it finds under `Plugins`, so do not leave other copies in that folder or
+its subfolders.
+
 Do not run another EC-writing or fan-control utility at the same time.
 
 ## Compatibility and evidence
 
 | Model | Required board | Firmware/runtime gate | Status |
 |---|---|---|---|
-| M1 Pro | `ARBSC` | outer/native controller `55 71 07`, exact `0x200d = 0xcb`, and one of two exact known stock curve tables | Hardware-validated on board revision 1.0, BIOS 1.01 |
-| M1 Lite | `MTBSI` | exact EC 0.02 build identity, read/write controller mode, and one of two exact stock curve tables | Derived from BIOS/EC analysis; no live hardware validation |
+| M1 Pro | `ARBSC` | outer/native controller `55 71 07`, exact `0x200d = 0xcb`, plausible telemetry, and an exact stock or plugin-recoverable curve table | Hardware-validated on board revision 1.0, BIOS 1.01 |
+| M1 Lite | `MTBSI` | exact EC 0.02 build identity, read/write controller mode, coherent target/telemetry envelopes, and an exact stock or plugin-recoverable curve table | Derived from BIOS/EC analysis; no live hardware validation |
 
 The internal curve selector maps `0xb0` and `0xb2` to the normal table and
 `0xb1` to the alternate table. These values are not named BIOS power profiles.
@@ -60,12 +67,15 @@ exposes the complete `0..51` FanControl scale for both channels, including
 System off. CPU codes `1..17`, System codes `0..9`, and System codes `42..51`
 remain hardware-unvalidated; raw byte values above 51 are not exposed.
 
-At startup the plugin captures and verifies the full 64-byte curve block.
-Manual control owns, modifies, and restores only its 30 base/slope bytes. It
-writes slopes before bases, verifies the full block after every transaction,
-and restores bases before slopes. Ownership checks, writes, readbacks, and any
-bounded recovery all run under one ISA mutex acquisition. Any unresolved mode,
-threshold, owned-byte, identity, or readback mismatch stops further writes.
+At startup the plugin verifies the full 64-byte curve block. Manual control
+owns, modifies, and restores only its 30 base/slope bytes. Entering manual
+control zeroes slopes before writing bases; subsequent target updates write
+only the base bytes once zero slopes have been verified, and restoration writes
+bases before slopes. Ownership checks, writes, readbacks, and bounded recovery
+all run under one ISA mutex acquisition, with transport-level read/write
+allowlists and tear-free high/low/high 16-bit RPM sampling. Any unresolved
+mode, threshold, owned-byte, identity, or readback mismatch stops further
+writes.
 
 Manual control replaces the OEM temperature-dependent curve, including its
 high-temperature fan escalation. If you want a guard, configure a curve from a
@@ -87,27 +97,53 @@ dotnet run --project .\tests\FanControl.MinisforumM1Pro.Tests.csproj -c Release
 ```
 
 The console harness is hardware-free. It covers both profiles, controller-slot
-discovery and native port sequencing, all startup gates and hysteresis boundary
-samples, policy bounds, model metadata, write ordering, readback, ownership
-drift, verified recovery, and failure containment.
+discovery and native port sequencing, transport allowlists and Super-I/O park
+poisoning, tear-free RPM decoding, all startup gates and hysteresis boundary
+samples, startup recovery and diagnostic rejection messages, policy bounds,
+model metadata, write ordering, readback, ownership drift, firmware resets,
+retryable cleanup, and failure containment.
 
 ## Recovery behavior
 
 Disabling a control restores that fan's captured startup values. A normal
-plugin refresh or FanControl exit restores both modified channels. Closing the
-plugin without ever enabling a control performs no EC data write.
+plugin refresh, FanControl exit, or graceful process shutdown restores both
+modified channels. Closing the plugin without ever enabling a control performs
+no EC data write.
 
 Any Set or Reset failure closes the backend and attempts a verified full
-baseline restoration. The plugin logs the failure instead of throwing it to
-FanControl, which would otherwise stop updating every other fan and sensor.
-The plugin's controls then stay idle until FanControl is refreshed. An invalid
-command, such as NaN from a broken curve, returns that fan to the firmware
-curve. If restoration fails, restart Windows before the plugin can be
-initialized again.
+baseline restoration (accepting an external firmware reset if the EC has
+already returned to an exact stock table). The plugin logs the failure instead
+of throwing it to FanControl, which would otherwise stop updating every other
+fan and sensor. The plugin's controls then stay idle until FanControl is
+refreshed. If cleanup fails transiently, refreshing FanControl retries
+restoration before reinitializing. An invalid command, such as NaN from a
+broken curve, returns that fan to the firmware curve.
 
-Force-terminating FanControl can leave manual values active. Restart Windows
-before reopening FanControl after a forced termination. M1 Lite startup also
-requires an exact stock curve, so it intentionally refuses a stale manual
-curve until firmware startup has restored it. M1 Pro also requires one of the
-two known stock tables, preventing a partial crash-left curve from becoming a
-new baseline.
+Force-terminating FanControl or rebooting Windows while an error dialog vetoes
+shutdown can leave manual values in EC XRAM across warm restarts. On the next
+startup, if all identity gates and all 34 unowned curve bytes match the active
+stock table and the 30 owned bytes match an exact plugin manual or interrupted
+transition state, the plugin automatically restores and verifies the canonical
+firmware curve before exposing controls. If EC XRAM ever holds an unrecognized
+non-stock state, the plugin refuses to write; fully shut down Windows and
+briefly unplug AC power so the EC reloads its stock table from flash.
+
+## Troubleshooting
+
+**"Failed to load plugin ... Make sure the plugin's dll is unblocked in its
+properties."** FanControl shows this for any `FileLoadException`, not only for
+blocked files. For this plugin it usually means FanControl found two copies of
+`FanControl.MinisforumM1Pro.dll` with different versions, for example an older
+copy placed directly in `Plugins`. FanControl searches every subfolder of
+`Plugins`, keeps running the copy it loaded first, and rejects the other one.
+`log.txt` in the FanControl directory then shows `Assembly with same name is
+already loaded`. Unblocking the file does not help. Exit FanControl, delete
+every copy except `Plugins\MinisforumM1Pro\FanControl.MinisforumM1Pro.dll`,
+make sure that copy is the latest release, and start FanControl again. This
+PowerShell command lists every DLL that FanControl tries to load as a plugin,
+with its assembly version:
+
+```powershell
+Get-ChildItem "C:\Program Files (x86)\FanControl\Plugins" -Recurse -Filter "FanControl*.dll" |
+    ForEach-Object { "{0}  {1}" -f [Reflection.AssemblyName]::GetAssemblyName($_.FullName), $_.FullName }
+```

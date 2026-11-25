@@ -5,10 +5,12 @@ namespace FanControl.MinisforumM1Pro;
 /// <summary>Exposes supported Minisforum M1 fan telemetry and controls.</summary>
 public sealed class M1ProPlugin : IPlugin2
 {
+    private readonly object lifecycleSync = new();
     private readonly M1ModelProfile profile;
     private readonly Func<string> boardReader;
     private readonly Func<M1ModelProfile, IM1Backend> backendFactory;
     private readonly IPluginLogger? logger;
+    private readonly EventHandler processExitHandler;
     private readonly Sensor cpuFan;
     private readonly Sensor systemFan;
     private readonly Sensor cpuTemperature;
@@ -16,7 +18,8 @@ public sealed class M1ProPlugin : IPlugin2
     private readonly ControlSensor cpuControl;
     private readonly ControlSensor systemControl;
     private IM1Backend? backend;
-    private bool recoveryFailed;
+    private IM1Backend? pendingRestore;
+    private bool processExitRegistered;
 
     /// <summary>Creates the plugin with the native PawnIO backend.</summary>
     public M1ProPlugin()
@@ -50,6 +53,7 @@ public sealed class M1ProPlugin : IPlugin2
         this.backendFactory = backendFactory ??
             throw new ArgumentNullException(nameof(backendFactory));
         this.logger = logger;
+        processExitHandler = OnProcessExit;
 
         string prefix = profile.SensorIdPrefix;
         cpuFan = new Sensor($"{prefix}.fan1", $"{profile.ModelName} CPU Fan");
@@ -80,32 +84,41 @@ public sealed class M1ProPlugin : IPlugin2
     /// <inheritdoc />
     public void Initialize()
     {
-        Close();
-        if (recoveryFailed)
+        lock (lifecycleSync)
         {
-            throw new InvalidOperationException(
-                $"{profile.ModelName} baseline restoration previously failed. " +
-                "Restart Windows before reinitializing the plugin.");
-        }
-        HostIdentityGate.AssertBoard(profile, boardReader());
-        IM1Backend candidate = backendFactory(profile);
-        try
-        {
-            candidate.Initialize();
-            Apply(candidate.ReadTelemetry());
-            backend = candidate;
-            Log($"{profile.ModelName} {profile.Board} backend initialized.");
-            if (!profile.HardwareValidated)
+            CloseCore(logRetrySuccess: true);
+            if (pendingRestore is not null)
             {
-                Log(
-                    $"{profile.ModelName} support is analysis-derived and experimental; " +
-                    "its transport and physical control range have not been validated on hardware.");
+                throw new InvalidOperationException(
+                    $"{profile.ModelName} baseline restoration remains pending. " +
+                    "Shut down Windows and briefly unplug AC power before " +
+                    $"reinitializing {profile.ModelName}.");
             }
-        }
-        catch
-        {
-            candidate.Dispose();
-            throw;
+
+            HostIdentityGate.AssertBoard(profile, boardReader());
+            IM1Backend candidate = backendFactory(profile);
+            try
+            {
+                candidate.Initialize();
+                Apply(candidate.ReadTelemetry());
+                Volatile.Write(ref backend, candidate);
+                RegisterProcessExit();
+                string? summary = candidate.StartupSummary;
+                Log(string.IsNullOrWhiteSpace(summary)
+                    ? $"{profile.ModelName} {profile.Board} backend initialized."
+                    : $"{profile.ModelName} {profile.Board} backend initialized ({summary}).");
+                if (!profile.HardwareValidated)
+                {
+                    Log(
+                        $"{profile.ModelName} support is analysis-derived and experimental; " +
+                        "its transport and physical control range have not been validated on hardware.");
+                }
+            }
+            catch
+            {
+                candidate.Dispose();
+                throw;
+            }
         }
     }
 
@@ -139,24 +152,87 @@ public sealed class M1ProPlugin : IPlugin2
     /// <inheritdoc />
     public void Close()
     {
+        lock (lifecycleSync)
+        {
+            CloseCore(logRetrySuccess: false);
+        }
+    }
+
+    internal void HandleProcessExit()
+    {
+        try
+        {
+            Close();
+        }
+        catch
+        {
+        }
+    }
+
+    private void OnProcessExit(object? sender, EventArgs args) => HandleProcessExit();
+
+    private void CloseCore(bool logRetrySuccess)
+    {
         cpuControl.Clear();
         systemControl.Clear();
         ClearTelemetry();
-        IM1Backend? old = Interlocked.Exchange(ref backend, null);
-        if (old is null)
+
+        IM1Backend? active = Interlocked.Exchange(ref backend, null);
+        if (active is not null)
         {
-            return;
+            TryDisposeBackend(active, wasPendingRetry: false, logRetrySuccess: false);
+        }
+        else if (pendingRestore is not null)
+        {
+            IM1Backend retry = pendingRestore;
+            pendingRestore = null;
+            TryDisposeBackend(retry, wasPendingRetry: true, logRetrySuccess);
         }
 
+        if (Volatile.Read(ref backend) is null && pendingRestore is null)
+        {
+            UnregisterProcessExit();
+        }
+    }
+
+    private void TryDisposeBackend(
+        IM1Backend target,
+        bool wasPendingRetry,
+        bool logRetrySuccess)
+    {
         try
         {
-            old.Dispose();
+            target.Dispose();
+            if (wasPendingRetry && logRetrySuccess)
+            {
+                Log($"{profile.ModelName} pending baseline restoration succeeded.");
+            }
         }
         catch (Exception exception)
         {
-            recoveryFailed = true;
+            pendingRestore = target;
             Log($"{profile.ModelName} baseline restoration failed: {exception.Message}");
-            Log($"Restart Windows before reinitializing {profile.ModelName}.");
+            Log(
+                "Refresh FanControl to retry restoration, or shut down Windows and " +
+                $"briefly unplug AC power before reinitializing {profile.ModelName}.");
+        }
+    }
+
+    private void RegisterProcessExit()
+    {
+        if (!processExitRegistered)
+        {
+            AppDomain.CurrentDomain.ProcessExit += processExitHandler;
+            processExitRegistered = true;
+        }
+    }
+
+    private void UnregisterProcessExit()
+    {
+        if (processExitRegistered)
+        {
+            AppDomain.CurrentDomain.ProcessExit -= processExitHandler;
+            processExitRegistered = false;
         }
     }
 
@@ -222,8 +298,13 @@ public sealed class M1ProPlugin : IPlugin2
         }
 
         Log($"{ControlFor(fan).Name} failed: {exception.Message}");
-        Close();
-        if (!recoveryFailed)
+        bool restored;
+        lock (lifecycleSync)
+        {
+            CloseCore(logRetrySuccess: false);
+            restored = pendingRestore is null;
+        }
+        if (restored)
         {
             Log($"{profile.ModelName} fans returned to the firmware curve. " +
                 "Refresh FanControl to resume control.");

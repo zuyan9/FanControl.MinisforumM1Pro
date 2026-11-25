@@ -1,4 +1,5 @@
 using System.Reflection;
+using System.Runtime.ExceptionServices;
 using System.Runtime.InteropServices;
 
 namespace FanControl.MinisforumM1Pro;
@@ -28,11 +29,14 @@ internal interface IM1Transport : IDisposable
 
 internal sealed class PawnIoTransport : IM1Transport
 {
+    private static readonly TimeSpan IsaTimeout = TimeSpan.FromSeconds(5);
     private readonly Mutex isaMutex = new(false, M1EcLayout.IsaMutexName);
     private readonly IPawnIoExecutor native;
     private readonly byte slot;
     private readonly ulong outerIndexPort;
     private readonly SelectedAccess selectedAccess;
+    private bool disposed;
+    private Exception? poisonCause;
 
     internal PawnIoTransport(byte slot)
         : this(slot, CreateResources())
@@ -66,11 +70,12 @@ internal sealed class PawnIoTransport : IM1Transport
             selectedAccess = new SelectedAccess(this);
             native.OpenAndLoad(module);
         }
-        catch
+        catch (Exception exception)
         {
-            native.Dispose();
-            isaMutex.Dispose();
-            throw;
+            Exception? failure = exception;
+            failure = CaptureFailure(failure, native.Dispose);
+            failure = CaptureFailure(failure, isaMutex.Dispose);
+            ExceptionDispatchInfo.Capture(failure!).Throw();
         }
     }
 
@@ -80,47 +85,83 @@ internal sealed class PawnIoTransport : IM1Transport
         return RunIsa(() =>
         {
             bool selected = false;
+            T result = default!;
+            Exception? bodyFailure = null;
             try
             {
                 SelectSlot();
                 selected = true;
-                return action(selectedAccess);
+                result = action(selectedAccess);
             }
-            finally
+            catch (Exception exception)
             {
-                if (selected)
-                {
-                    Park();
-                }
-                else
-                {
-                    ParkOuterIndex();
-                }
+                bodyFailure = exception;
             }
+
+            Exception? nestedParkFailure = selected
+                ? CaptureFailure(null, () => Out(0x2e, 0x10))
+                : null;
+            Exception? outerParkFailure = CaptureFailure(null, ParkOuterIndex);
+            if (outerParkFailure is not null)
+            {
+                Exception combined = Combine(
+                    Combine(bodyFailure, nestedParkFailure),
+                    outerParkFailure)!;
+                Poison(combined);
+                throw AmbiguousSelectorState(
+                    "EC access did not park the Super-I/O index port.",
+                    combined);
+            }
+
+            Exception? totalFailure = Combine(bodyFailure, nestedParkFailure);
+            if (totalFailure is not null)
+            {
+                ExceptionDispatchInfo.Capture(totalFailure).Throw();
+            }
+            return result;
         });
     }
 
     public byte[] ReadOuterIdentity() => RunIsa(() =>
     {
+        byte[] result = null!;
+        Exception? bodyFailure = null;
         try
         {
             SelectSlot();
-            return new[]
-            {
+            result =
+            [
                 checked((byte)In(0x20)),
                 checked((byte)In(0x21)),
                 checked((byte)In(0x22)),
-            };
+            ];
         }
-        finally
+        catch (Exception exception)
         {
-            ParkOuterIndex();
+            bodyFailure = exception;
         }
+
+        Exception? outerParkFailure = CaptureFailure(null, ParkOuterIndex);
+        if (outerParkFailure is not null)
+        {
+            Exception combined = Combine(bodyFailure, outerParkFailure)!;
+            Poison(combined);
+            throw AmbiguousSelectorState(
+                "Outer controller probe did not park the Super-I/O index port.",
+                combined);
+        }
+
+        if (bodyFailure is not null)
+        {
+            ExceptionDispatchInfo.Capture(bodyFailure).Throw();
+        }
+        return result;
     });
 
     private byte[] ReadSelected(ushort[] addresses)
     {
         ArgumentNullException.ThrowIfNull(addresses);
+        M1EcLayout.AssertReadsAllowed(addresses);
         byte[] values = new byte[addresses.Length];
         for (int index = 0; index < addresses.Length; index++)
         {
@@ -134,6 +175,7 @@ internal sealed class PawnIoTransport : IM1Transport
     private void WriteSelected(EcWrite[] writes)
     {
         ArgumentNullException.ThrowIfNull(writes);
+        M1EcLayout.AssertWritesAllowed(writes);
         foreach (EcWrite write in writes)
         {
             SetAddress(write.Address);
@@ -144,18 +186,30 @@ internal sealed class PawnIoTransport : IM1Transport
 
     public void Dispose()
     {
-        native.Dispose();
-        isaMutex.Dispose();
+        if (disposed)
+        {
+            return;
+        }
+        disposed = true;
+        Exception? failure = CaptureFailure(null, native.Dispose);
+        failure = CaptureFailure(failure, isaMutex.Dispose);
+        if (failure is not null)
+        {
+            ExceptionDispatchInfo.Capture(failure).Throw();
+        }
     }
 
     private T RunIsa<T>(Func<T> action)
     {
+        EnsureUsable();
         bool held = false;
+        T result = default!;
+        Exception? failure = null;
         try
         {
             try
             {
-                held = isaMutex.WaitOne(TimeSpan.FromSeconds(5));
+                held = isaMutex.WaitOne(IsaTimeout);
             }
             catch (AbandonedMutexException)
             {
@@ -166,15 +220,74 @@ internal sealed class PawnIoTransport : IM1Transport
             {
                 throw new TimeoutException("Timed out acquiring the ISA mutex.");
             }
-            return action();
+            result = action();
+        }
+        catch (Exception exception)
+        {
+            failure = exception;
         }
         finally
         {
             if (held)
             {
-                isaMutex.ReleaseMutex();
+                Exception? releaseFailure = CaptureFailure(null, isaMutex.ReleaseMutex);
+                if (releaseFailure is not null)
+                {
+                    Poison(releaseFailure);
+                    failure = Combine(
+                        failure,
+                        AmbiguousSelectorState(
+                            "Releasing the ISA mutex failed.",
+                            releaseFailure));
+                }
             }
         }
+
+        if (failure is not null)
+        {
+            ExceptionDispatchInfo.Capture(failure).Throw();
+        }
+        return result;
+    }
+
+    private void EnsureUsable()
+    {
+        ObjectDisposedException.ThrowIf(disposed, this);
+        if (poisonCause is not null)
+        {
+            throw AmbiguousSelectorState(
+                "PawnIO transport was poisoned by an earlier Super-I/O cleanup failure.",
+                poisonCause);
+        }
+    }
+
+    private void Poison(Exception exception) => poisonCause ??= exception;
+
+    private static InvalidOperationException AmbiguousSelectorState(
+        string detail,
+        Exception? inner) => new(
+            detail + " Super-I/O selector state is ambiguous; shut down Windows and " +
+            "briefly unplug AC power before accessing the controller again.",
+            inner);
+
+    private static Exception? Combine(Exception? first, Exception? second) =>
+        first is null
+            ? second
+            : second is null
+                ? first
+                : new AggregateException(first, second);
+
+    private static Exception? CaptureFailure(Exception? failure, Action action)
+    {
+        try
+        {
+            action();
+        }
+        catch (Exception exception)
+        {
+            return Combine(failure, exception);
+        }
+        return failure;
     }
 
     private void SelectSlot() => native.Execute("ioctl_select_slot", [slot], 0);
@@ -185,18 +298,6 @@ internal sealed class PawnIoTransport : IM1Transport
         Out(0x2f, (ulong)(address >> 8));
         Out(0x2e, 0x10);
         Out(0x2f, (ulong)(address & 0xff));
-    }
-
-    private void Park()
-    {
-        try
-        {
-            Out(0x2e, 0x10);
-        }
-        finally
-        {
-            ParkOuterIndex();
-        }
     }
 
     private void ParkOuterIndex() =>
@@ -231,9 +332,10 @@ internal sealed class PawnIoTransport : IM1Transport
         {
             return (native, LoadLpcModule());
         }
-        catch
+        catch (Exception loadFailure)
         {
-            native.Dispose();
+            Exception? failure = CaptureFailure(loadFailure, native.Dispose);
+            ExceptionDispatchInfo.Capture(failure!).Throw();
             throw;
         }
     }
@@ -261,6 +363,9 @@ internal sealed class PawnIoTransport : IM1Transport
 
 internal sealed class PawnIoNative : IPawnIoExecutor
 {
+    [UnmanagedFunctionPointer(CallingConvention.StdCall)]
+    private delegate int VersionDelegate(out uint version);
+
     [UnmanagedFunctionPointer(CallingConvention.StdCall)]
     private delegate int OpenDelegate(out IntPtr handle);
 
@@ -292,10 +397,18 @@ internal sealed class PawnIoNative : IPawnIoExecutor
         library = NativeLibrary.Load(libraryPath);
         try
         {
+            VersionDelegate version = Export<VersionDelegate>("pawnio_version");
             open = Export<OpenDelegate>("pawnio_open");
             load = Export<LoadDelegate>("pawnio_load");
             execute = Export<ExecuteDelegate>("pawnio_execute");
             close = Export<CloseDelegate>("pawnio_close");
+            Check(version(out uint apiVersion), "pawnio_version");
+            if ((apiVersion >> 16) != M1EcLayout.PawnIoMajorVersion)
+            {
+                throw new InvalidOperationException(
+                    $"PawnIO API 0x{apiVersion:X8} is not supported; expected major " +
+                    $"version {M1EcLayout.PawnIoMajorVersion}.");
+            }
         }
         catch
         {
@@ -316,9 +429,17 @@ internal sealed class PawnIoNative : IPawnIoExecutor
         {
             Check(load(handle, module, (nuint)module.Length), "pawnio_load");
         }
-        catch
+        catch (Exception loadFailure)
         {
-            close(handle);
+            try
+            {
+                Check(close(handle), "pawnio_close");
+            }
+            catch (Exception closeFailure)
+            {
+                handle = IntPtr.Zero;
+                throw new AggregateException(loadFailure, closeFailure);
+            }
             handle = IntPtr.Zero;
             throw;
         }
@@ -347,15 +468,36 @@ internal sealed class PawnIoNative : IPawnIoExecutor
 
     public void Dispose()
     {
+        Exception? failure = null;
         if (handle != IntPtr.Zero)
         {
-            close(handle);
+            try
+            {
+                Check(close(handle), "pawnio_close");
+            }
+            catch (Exception exception)
+            {
+                failure = exception;
+            }
             handle = IntPtr.Zero;
         }
         if (library != IntPtr.Zero)
         {
-            NativeLibrary.Free(library);
+            try
+            {
+                NativeLibrary.Free(library);
+            }
+            catch (Exception exception)
+            {
+                failure = failure is null
+                    ? exception
+                    : new AggregateException(failure, exception);
+            }
             library = IntPtr.Zero;
+        }
+        if (failure is not null)
+        {
+            ExceptionDispatchInfo.Capture(failure).Throw();
         }
     }
 
