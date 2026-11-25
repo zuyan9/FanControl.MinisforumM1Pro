@@ -2,6 +2,8 @@ namespace FanControl.MinisforumM1Pro;
 
 internal interface IM1Backend : IDisposable
 {
+    string? StartupSummary { get; }
+
     void Initialize();
 
     M1Telemetry ReadTelemetry();

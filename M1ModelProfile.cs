@@ -12,6 +12,19 @@ internal enum ReportedCodeMode
     Applied,
 }
 
+internal enum CurveStartupState
+{
+    Firmware,
+    Recoverable,
+    Unsupported,
+}
+
+internal sealed record CurveStartupClassification(
+    CurveStartupState State,
+    byte Mode,
+    byte[]? CanonicalCurve,
+    string Detail);
+
 internal readonly record struct FanControlRequest(
     byte AppliedCode,
     float ReportedPercentage);
@@ -92,11 +105,13 @@ internal sealed class FanControlPolicy
             reported * 100f / MaximumCode);
     }
 
+    internal bool AcceptsCode(byte code) =>
+        code <= MaximumCode &&
+        ((code == 0 && AllowOff) || code >= MinimumNonzeroCode);
+
     internal void AssertCode(byte code)
     {
-        bool allowed = code <= MaximumCode &&
-            ((code == 0 && AllowOff) || code >= MinimumNonzeroCode);
-        if (!allowed)
+        if (!AcceptsCode(code))
         {
             throw new ArgumentOutOfRangeException(
                 nameof(code),
@@ -115,8 +130,7 @@ internal sealed class FanControlPolicy
         }
 
         int code = rpm / 100;
-        return code <= MaximumCode &&
-            ((code == 0 && AllowOff) || code >= MinimumNonzeroCode);
+        return code <= byte.MaxValue && AcceptsCode((byte)code);
     }
 }
 
@@ -127,6 +141,13 @@ internal readonly record struct EcExpectation(
 
 internal sealed class M1ModelProfile
 {
+    private enum ChannelStartupState
+    {
+        Firmware,
+        Recoverable,
+        Unsupported,
+    }
+
     private readonly EcExpectation[] startupProbe;
     private readonly byte[] candidateSlots;
     private readonly byte[]? normalCurve;
@@ -298,9 +319,101 @@ internal sealed class M1ModelProfile
         };
     }
 
+    internal CurveStartupClassification ClassifyStartupCurve(
+        byte mode,
+        ReadOnlySpan<byte> curve)
+    {
+        if (curve.Length != M1EcLayout.CurveBlockLength)
+        {
+            throw new ArgumentException(
+                $"Expected a {M1EcLayout.CurveBlockLength}-byte EC curve block.",
+                nameof(curve));
+        }
+
+        byte[]? canonical = StockCurve(mode);
+        if (canonical is null)
+        {
+            return new CurveStartupClassification(
+                CurveStartupState.Unsupported,
+                mode,
+                null,
+                $"unknown EC curve selector 0x{mode:x2}");
+        }
+
+        for (int offset = 0; offset < M1EcLayout.CurveBlockLength; offset++)
+        {
+            if (!M1EcLayout.IsOwnedOffset(offset) && curve[offset] != canonical[offset])
+            {
+                ushort address = (ushort)(M1EcLayout.CurveBlockStart + offset);
+                return new CurveStartupClassification(
+                    CurveStartupState.Unsupported,
+                    mode,
+                    null,
+                    $"unowned EC curve mismatch at 0x{address:x4} " +
+                    $"(read 0x{curve[offset]:x2}, expected 0x{canonical[offset]:x2} " +
+                    $"for selector 0x{mode:x2})");
+            }
+        }
+
+        if (curve.SequenceEqual(canonical))
+        {
+            return new CurveStartupClassification(
+                CurveStartupState.Firmware,
+                mode,
+                canonical,
+                $"selector 0x{mode:x2}");
+        }
+
+        (ChannelStartupState cpuState, string cpuDetail) = ClassifyChannel(
+            M1Fan.Cpu,
+            CpuPolicy,
+            curve,
+            canonical,
+            mode);
+        if (cpuState == ChannelStartupState.Unsupported)
+        {
+            return new CurveStartupClassification(
+                CurveStartupState.Unsupported,
+                mode,
+                null,
+                cpuDetail);
+        }
+
+        (ChannelStartupState systemState, string systemDetail) = ClassifyChannel(
+            M1Fan.System,
+            SystemPolicy,
+            curve,
+            canonical,
+            mode);
+        if (systemState == ChannelStartupState.Unsupported)
+        {
+            return new CurveStartupClassification(
+                CurveStartupState.Unsupported,
+                mode,
+                null,
+                systemDetail);
+        }
+
+        List<string> details = [];
+        if (cpuState == ChannelStartupState.Recoverable)
+        {
+            details.Add(cpuDetail);
+        }
+        if (systemState == ChannelStartupState.Recoverable)
+        {
+            details.Add(systemDetail);
+        }
+        return new CurveStartupClassification(
+            CurveStartupState.Recoverable,
+            mode,
+            canonical,
+            string.Join(", ", details));
+    }
+
     internal void AssertRuntimeSample(
         ReadOnlySpan<byte> values,
-        ReadOnlySpan<byte> curve)
+        ReadOnlySpan<byte> curve,
+        bool checkCurveHysteresis = true)
     {
         if (!ValidateTargets)
         {
@@ -319,18 +432,16 @@ internal sealed class M1ModelProfile
         byte systemTemperature = values[5];
         byte cpuCode = values[6];
         byte systemCode = values[7];
+        bool hysteresisCoherent = !checkCurveHysteresis ||
+            (IsHysteresisValidCode(M1Fan.Cpu, cpuTemperature, cpuCode, curve) &&
+             IsHysteresisValidCode(M1Fan.System, systemTemperature, systemCode, curve));
         if (!CpuPolicy.AcceptsTargetRpm(cpuRpm) ||
             !SystemPolicy.AcceptsTargetRpm(systemRpm) ||
             cpuRpm != cpuCode * 100 ||
             systemRpm != systemCode * 100 ||
             cpuTemperature > 125 ||
             systemTemperature > 125 ||
-            !IsHysteresisValidCode(M1Fan.Cpu, cpuTemperature, cpuCode, curve) ||
-            !IsHysteresisValidCode(
-                M1Fan.System,
-                systemTemperature,
-                systemCode,
-                curve))
+            !hysteresisCoherent)
         {
             throw new PlatformNotSupportedException(
                 $"{ModelName} EC targets, final codes, temperatures, and stock " +
@@ -338,6 +449,141 @@ internal sealed class M1ModelProfile
                 $"{cpuTemperature} C, system {systemRpm} RPM/code {systemCode} " +
                 $"at {systemTemperature} C.");
         }
+    }
+
+    private static (ChannelStartupState State, string Detail) ClassifyChannel(
+        M1Fan fan,
+        FanControlPolicy policy,
+        ReadOnlySpan<byte> curve,
+        ReadOnlySpan<byte> canonical,
+        byte mode)
+    {
+        string label = fan == M1Fan.Cpu ? "CPU" : "system";
+        ReadOnlySpan<ushort> baseAddresses = M1EcLayout.BaseAddresses(fan);
+        ReadOnlySpan<ushort> slopeAddresses = M1EcLayout.SlopeAddresses(fan);
+        Span<byte> observedBases = stackalloc byte[baseAddresses.Length];
+        Span<byte> canonicalBases = stackalloc byte[baseAddresses.Length];
+        Span<byte> observedSlopes = stackalloc byte[slopeAddresses.Length];
+        Span<byte> canonicalSlopes = stackalloc byte[slopeAddresses.Length];
+
+        for (int index = 0; index < baseAddresses.Length; index++)
+        {
+            int baseOffset = baseAddresses[index] - M1EcLayout.CurveBlockStart;
+            int slopeOffset = slopeAddresses[index] - M1EcLayout.CurveBlockStart;
+            observedBases[index] = curve[baseOffset];
+            canonicalBases[index] = canonical[baseOffset];
+            observedSlopes[index] = curve[slopeOffset];
+            canonicalSlopes[index] = canonical[slopeOffset];
+        }
+
+        if (observedBases.SequenceEqual(canonicalBases) &&
+            observedSlopes.SequenceEqual(canonicalSlopes))
+        {
+            return (ChannelStartupState.Firmware, string.Empty);
+        }
+
+        if (observedBases.SequenceEqual(canonicalBases))
+        {
+            for (int index = 0; index < observedSlopes.Length; index++)
+            {
+                if (observedSlopes[index] != 0 &&
+                    observedSlopes[index] != canonicalSlopes[index])
+                {
+                    return (
+                        ChannelStartupState.Unsupported,
+                        $"{label} slope mismatch at 0x{slopeAddresses[index]:x4} " +
+                        $"(read 0x{observedSlopes[index]:x2}, expected 0x00 or " +
+                        $"0x{canonicalSlopes[index]:x2} for selector 0x{mode:x2})");
+                }
+            }
+            return (ChannelStartupState.Recoverable, $"{label} interrupted slope state");
+        }
+
+        for (int index = 0; index < observedSlopes.Length; index++)
+        {
+            if (observedSlopes[index] != 0)
+            {
+                return (
+                    ChannelStartupState.Unsupported,
+                    $"{label} curve has non-zero slope 0x{observedSlopes[index]:x2} " +
+                    $"at 0x{slopeAddresses[index]:x4} with non-canonical bases for " +
+                    $"selector 0x{mode:x2}");
+            }
+        }
+
+        byte uniformCode = observedBases[0];
+        if (!observedBases.ContainsAnyExcept(uniformCode))
+        {
+            return policy.AcceptsCode(uniformCode)
+                ? (ChannelStartupState.Recoverable, $"{label} manual code {uniformCode}")
+                : (
+                    ChannelStartupState.Unsupported,
+                    $"{label} curve at 0x{baseAddresses[0]:x4} has disallowed manual " +
+                    $"code {uniformCode} for selector 0x{mode:x2}");
+        }
+
+        for (int restored = 0; restored < observedBases.Length; restored++)
+        {
+            if (!observedBases[..restored].SequenceEqual(canonicalBases[..restored]))
+            {
+                continue;
+            }
+            for (int written = restored + 1; written <= observedBases.Length; written++)
+            {
+                byte code = observedBases[restored];
+                if (policy.AcceptsCode(code) &&
+                    !observedBases.Slice(restored, written - restored).ContainsAnyExcept(code) &&
+                    observedBases[written..].SequenceEqual(canonicalBases[written..]))
+                {
+                    return (
+                        ChannelStartupState.Recoverable,
+                        $"{label} interrupted manual code {code}");
+                }
+            }
+        }
+
+        for (int restored = 0; restored < observedBases.Length; restored++)
+        {
+            if (!observedBases[..restored].SequenceEqual(canonicalBases[..restored]))
+            {
+                continue;
+            }
+            ReadOnlySpan<byte> suffix = observedBases[restored..];
+            byte first = suffix[0];
+            if (!policy.AcceptsCode(first))
+            {
+                continue;
+            }
+            int transition = suffix.IndexOfAnyExcept(first);
+            if (transition < 0)
+            {
+                return (
+                    ChannelStartupState.Recoverable,
+                    $"{label} interrupted restore from code {first}");
+            }
+            byte second = suffix[transition];
+            if (policy.AcceptsCode(second) &&
+                !suffix[transition..].ContainsAnyExcept(second))
+            {
+                return (
+                    ChannelStartupState.Recoverable,
+                    $"{label} interrupted manual transition {first}->{second}");
+            }
+        }
+
+        for (int index = 0; index < observedBases.Length; index++)
+        {
+            if (observedBases[index] != canonicalBases[index])
+            {
+                return (
+                    ChannelStartupState.Unsupported,
+                    $"{label} curve mismatch at 0x{baseAddresses[index]:x4} " +
+                    $"(read 0x{observedBases[index]:x2}, expected " +
+                    $"0x{canonicalBases[index]:x2} for selector 0x{mode:x2})");
+            }
+        }
+
+        return (ChannelStartupState.Unsupported, $"{label} curve state is unsupported");
     }
 
     private static bool IsHysteresisValidCode(
@@ -388,7 +634,7 @@ internal sealed class M1ModelProfile
             telemetry.SystemTemperatureC is < 0 or > 125)
         {
             throw new InvalidDataException(
-                $"{ModelName} EC telemetry is outside the accepted startup envelope.");
+                $"{ModelName} EC telemetry is outside the accepted envelope.");
         }
     }
 }
@@ -447,7 +693,8 @@ internal static class M1ModelProfiles
             new EcExpectation(0x200d, 0xcb),
         ],
         normalCurve: KnownNormalCurve,
-        alternateCurve: KnownAlternateCurve);
+        alternateCurve: KnownAlternateCurve,
+        validateTelemetry: true);
 
     internal static readonly M1ModelProfile M1Lite = new(
         key: "m1lite-mtbsi",
@@ -464,6 +711,18 @@ internal static class M1ModelProfiles
         alternateCurve: KnownAlternateCurve,
         validateTelemetry: true,
         validateTargets: true);
+
+    internal static bool IsAllowedCanonicalSlope(ushort address, byte value)
+    {
+        if (!M1EcLayout.IsSlopeAddress(address))
+        {
+            return false;
+        }
+
+        int offset = address - M1EcLayout.CurveBlockStart;
+        return KnownNormalCurve[offset] == value ||
+            KnownAlternateCurve[offset] == value;
+    }
 
     internal static M1ModelProfile ResolveExact(string board) =>
         TryResolveExact(board) ?? throw new PlatformNotSupportedException(

@@ -11,9 +11,11 @@ internal static class M1EcLayout
     internal const string IsaMutexName = "Global\\Access_ISABUS.HTP.Method";
     internal const string LpcResourceName =
         "LibreHardwareMonitor.Resources.PawnIo.LpcIO.bin";
+    internal const uint PawnIoMajorVersion = 2;
     internal const ushort ModeAddress = 0x032e;
     internal const ushort CurveBlockStart = 0x0640;
     internal const int CurveBlockLength = 0x40;
+    internal const byte MaximumRawCode = 51;
 
     private static readonly ushort[] CpuBases = Enumerable.Range(0, 8)
         .Select(row => (ushort)(0x0640 + (row * 3)))
@@ -30,6 +32,9 @@ internal static class M1EcLayout
     private static readonly ushort[] CpuOwned = [.. CpuBases, .. CpuSlopes];
     private static readonly ushort[] SystemOwned = [.. SystemBases, .. SystemSlopes];
     private static readonly ushort[] Owned = [.. CpuOwned, .. SystemOwned];
+    private static readonly HashSet<ushort> OwnedSet = [.. Owned];
+    private static readonly HashSet<ushort> BaseSet = [.. CpuBases, .. SystemBases];
+    private static readonly HashSet<ushort> SlopeSet = [.. CpuSlopes, .. SystemSlopes];
     private static readonly ushort[] AllRestoreOrder =
         [.. CpuBases, .. SystemBases, .. CpuSlopes, .. SystemSlopes];
     private static readonly ushort[] CurveBlock = Enumerable.Range(
@@ -37,15 +42,26 @@ internal static class M1EcLayout
             CurveBlockLength)
         .Select(address => (ushort)address)
         .ToArray();
+    private static readonly ushort[] CpuRpm = [0x0438, 0x0439, 0x0438];
+    private static readonly ushort[] SystemRpm = [0x043a, 0x043b, 0x043a];
     private static readonly ushort[] Telemetry =
-        [0x0438, 0x0439, 0x043a, 0x043b, 0x0428, 0x0429];
+    [
+        0x0438, 0x0439, 0x0438,
+        0x043a, 0x043b, 0x043a,
+        0x0428, 0x0429,
+    ];
     private static readonly ushort[] RuntimeSample =
         [0x0420, 0x0421, 0x0422, 0x0423, 0x0428, 0x0429, 0x0432, 0x0433];
     private static readonly ushort[] NativeIdentity = [0x2000, 0x2001, 0x2002];
+    private static HashSet<ushort>? readAllowlist;
 
     internal static ushort[] OwnedAddresses => (ushort[])Owned.Clone();
 
     internal static ushort[] CurveBlockAddresses => (ushort[])CurveBlock.Clone();
+
+    internal static ushort[] CpuRpmAddresses => (ushort[])CpuRpm.Clone();
+
+    internal static ushort[] SystemRpmAddresses => (ushort[])SystemRpm.Clone();
 
     internal static ushort[] TelemetryAddresses => (ushort[])Telemetry.Clone();
 
@@ -55,12 +71,41 @@ internal static class M1EcLayout
     internal static ushort[] NativeIdentityAddresses =>
         (ushort[])NativeIdentity.Clone();
 
-    internal static EcWrite[] ManualWrites(M1Fan fan, byte code)
+    internal static ReadOnlySpan<ushort> BaseAddresses(M1Fan fan) => fan switch
+    {
+        M1Fan.Cpu => CpuBases,
+        M1Fan.System => SystemBases,
+        _ => throw new ArgumentOutOfRangeException(nameof(fan)),
+    };
+
+    internal static ReadOnlySpan<ushort> SlopeAddresses(M1Fan fan) => fan switch
+    {
+        M1Fan.Cpu => CpuSlopes,
+        M1Fan.System => SystemSlopes,
+        _ => throw new ArgumentOutOfRangeException(nameof(fan)),
+    };
+
+    internal static bool IsOwnedAddress(ushort address) => OwnedSet.Contains(address);
+
+    internal static bool IsOwnedOffset(int offset) =>
+        (uint)offset < CurveBlockLength &&
+        OwnedSet.Contains((ushort)(CurveBlockStart + offset));
+
+    internal static bool IsSlopeAddress(ushort address) => SlopeSet.Contains(address);
+
+    internal static EcWrite[] ManualWrites(
+        M1Fan fan,
+        byte code,
+        bool includeSlopes = true)
     {
         (ushort[] bases, ushort[] slopes) = Layout(fan);
-        return slopes.Select(address => new EcWrite(address, 0))
-            .Concat(bases.Select(address => new EcWrite(address, code)))
-            .ToArray();
+        IEnumerable<EcWrite> baseWrites = bases.Select(address =>
+            new EcWrite(address, code));
+        return includeSlopes
+            ? slopes.Select(address => new EcWrite(address, 0))
+                .Concat(baseWrites)
+                .ToArray()
+            : baseWrites.ToArray();
     }
 
     internal static byte[] CaptureOwned(ReadOnlySpan<byte> curve)
@@ -115,6 +160,48 @@ internal static class M1EcLayout
         }
         return result;
     }
+
+    internal static void AssertReadsAllowed(ReadOnlySpan<ushort> addresses)
+    {
+        HashSet<ushort> allowlist = GetReadAllowlist();
+        foreach (ushort address in addresses)
+        {
+            if (!allowlist.Contains(address))
+            {
+                throw new InvalidOperationException(
+                    $"EC read address 0x{address:x4} is not allowed.");
+            }
+        }
+    }
+
+    internal static void AssertWritesAllowed(ReadOnlySpan<EcWrite> writes)
+    {
+        foreach (EcWrite write in writes)
+        {
+            bool allowed =
+                (BaseSet.Contains(write.Address) && write.Value <= MaximumRawCode) ||
+                (SlopeSet.Contains(write.Address) &&
+                    (write.Value == 0 ||
+                     M1ModelProfiles.IsAllowedCanonicalSlope(write.Address, write.Value)));
+            if (!allowed)
+            {
+                throw new InvalidOperationException(
+                    $"EC write 0x{write.Address:x4}=0x{write.Value:x2} is not allowed.");
+            }
+        }
+    }
+
+    private static HashSet<ushort> GetReadAllowlist() =>
+        LazyInitializer.EnsureInitialized(ref readAllowlist, static () =>
+        [
+            ModeAddress,
+            .. CurveBlock,
+            .. Telemetry,
+            .. RuntimeSample,
+            .. NativeIdentity,
+            .. M1ModelProfiles.M1Pro.StartupProbeAddresses,
+            .. M1ModelProfiles.M1Lite.StartupProbeAddresses,
+        ]);
 
     private static byte BaselineValue(ushort address, ReadOnlySpan<byte> baseline)
     {

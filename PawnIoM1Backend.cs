@@ -6,6 +6,7 @@ internal sealed class PawnIoM1Backend : IM1Backend
 {
     private const int CurveSnapshotAttempts = 6;
     private const int RuntimeSampleAttempts = 6;
+    private const int RpmRetryAttempts = 3;
     private readonly object sync = new();
     private readonly M1ModelProfile profile;
     private readonly Func<string> boardReader;
@@ -16,6 +17,7 @@ internal sealed class PawnIoM1Backend : IM1Backend
     private byte[]? baselineOwned;
     private byte[]? expectedCurve;
     private byte[]? recoveryCurve;
+    private string? startupSummary;
     private byte baselineMode;
     private byte? cpuCode;
     private byte? systemCode;
@@ -38,6 +40,17 @@ internal sealed class PawnIoM1Backend : IM1Backend
         this.boardReader = boardReader ?? throw new ArgumentNullException(nameof(boardReader));
         this.transportFactory = transportFactory ??
             throw new ArgumentNullException(nameof(transportFactory));
+    }
+
+    public string? StartupSummary
+    {
+        get
+        {
+            lock (sync)
+            {
+                return startupSummary;
+            }
+        }
     }
 
     internal byte? CodeFor(M1Fan fan)
@@ -69,24 +82,31 @@ internal sealed class PawnIoM1Backend : IM1Backend
             {
                 return;
             }
+            if (needsRestore)
+            {
+                throw new InvalidOperationException(
+                    $"{profile.ModelName} has an unresolved EC baseline restoration; " +
+                    "complete Dispose before initializing.");
+            }
 
             HostIdentityGate.AssertBoard(profile, boardReader());
             ControllerCandidate selected = DiscoverController();
             try
             {
-                CurveState startup = selected.Transport.RunExclusive(access =>
+                StartupProbeResult startup = selected.Transport.RunExclusive(access =>
                     ProbeNativeProfile(access, selected.OuterIdentity));
                 transport = selected.Transport;
                 outerIdentity = selected.OuterIdentity;
-                baselineMode = startup.Mode;
-                baselineCurve = startup.Curve;
-                expectedCurve = (byte[])startup.Curve.Clone();
-                baselineOwned = M1EcLayout.CaptureOwned(startup.Curve);
+                baselineMode = startup.Curve.Mode;
+                baselineCurve = startup.Curve.Curve;
+                expectedCurve = (byte[])startup.Curve.Curve.Clone();
+                baselineOwned = M1EcLayout.CaptureOwned(startup.Curve.Curve);
                 recoveryCurve = null;
                 cpuCode = null;
                 systemCode = null;
                 needsRestore = false;
                 ActiveSlot = selected.Slot;
+                startupSummary = startup.Summary;
             }
             catch
             {
@@ -100,13 +120,7 @@ internal sealed class PawnIoM1Backend : IM1Backend
     {
         lock (sync)
         {
-            return ActiveTransport().RunExclusive(access =>
-            {
-                M1Telemetry telemetry = M1TelemetryDecoder.Decode(
-                    access.Read(M1EcLayout.TelemetryAddresses));
-                profile.AssertTelemetry(telemetry);
-                return telemetry;
-            });
+            return ActiveTransport().RunExclusive(ReadAndAssertTelemetry);
         }
     }
 
@@ -118,9 +132,15 @@ internal sealed class PawnIoM1Backend : IM1Backend
             ActiveTransport().RunExclusive(active =>
             {
                 AssertTransactionReady(active);
-                if (GetCode(fan) != code)
+                byte? current = GetCode(fan);
+                if (current != code)
                 {
-                    ExecuteTransaction(active, M1EcLayout.ManualWrites(fan, code));
+                    ExecuteTransaction(
+                        active,
+                        M1EcLayout.ManualWrites(
+                            fan,
+                            code,
+                            includeSlopes: current is null));
                     SetCode(fan, code);
                     needsRestore = true;
                 }
@@ -156,40 +176,86 @@ internal sealed class PawnIoM1Backend : IM1Backend
         lock (sync)
         {
             IM1Transport? old = transport;
-            if (old is null)
+            transport = null;
+            if (old is null && !needsRestore)
             {
                 return;
             }
 
             Exception? failure = null;
-            try
+            if (old is not null)
             {
-                if (needsRestore)
+                try
                 {
-                    old.RunExclusive(active =>
+                    if (needsRestore)
+                    {
+                        old.RunExclusive(active =>
+                        {
+                            RestoreForDispose(active);
+                            return 0;
+                        });
+                    }
+                }
+                catch (Exception exception)
+                {
+                    failure = exception;
+                }
+
+                try
+                {
+                    old.Dispose();
+                }
+                catch (Exception exception)
+                {
+                    failure = Combine(failure, exception);
+                }
+            }
+            else
+            {
+                IM1Transport? retry = null;
+                try
+                {
+                    byte slot = ActiveSlot ?? throw new InvalidOperationException(
+                        "The active controller slot is unavailable for restoration.");
+                    retry = transportFactory(slot);
+                    byte[] discovered = retry.ReadOuterIdentity();
+                    profile.AssertOuterIdentity(discovered);
+                    if (!discovered.SequenceEqual(ActiveOuterIdentity()))
+                    {
+                        throw new InvalidOperationException(
+                            $"{profile.ModelName} outer controller identity changed " +
+                            "before pending restoration.");
+                    }
+                    retry.RunExclusive(active =>
                     {
                         RestoreForDispose(active);
                         return 0;
                     });
                 }
-            }
-            catch (Exception exception)
-            {
-                failure = exception;
+                catch (Exception exception)
+                {
+                    failure = exception;
+                }
+                finally
+                {
+                    if (retry is not null)
+                    {
+                        try
+                        {
+                            retry.Dispose();
+                        }
+                        catch (Exception exception)
+                        {
+                            failure = Combine(failure, exception);
+                        }
+                    }
+                }
             }
 
-            try
+            if (!needsRestore)
             {
-                old.Dispose();
+                ClearState();
             }
-            catch (Exception exception)
-            {
-                failure = failure is null
-                    ? exception
-                    : new AggregateException(failure, exception);
-            }
-
-            ClearState();
             if (failure is not null)
             {
                 ExceptionDispatchInfo.Capture(failure).Throw();
@@ -258,7 +324,7 @@ internal sealed class PawnIoM1Backend : IM1Backend
             : new PlatformNotSupportedException(message, inner);
     }
 
-    private CurveState ProbeNativeProfile(
+    private StartupProbeResult ProbeNativeProfile(
         IM1TransportAccess candidate,
         ReadOnlySpan<byte> discoveredIdentity)
     {
@@ -267,44 +333,103 @@ internal sealed class PawnIoM1Backend : IM1Backend
             candidate.Read(M1EcLayout.NativeIdentityAddresses));
         AssertStartupProbe(candidate);
 
-        CurveState startup = profile.RequiresCurveFingerprint
-            ? CaptureStockCurve(candidate)
-            : ReadStableCurve(candidate);
+        if (!profile.RequiresCurveFingerprint)
+        {
+            CurveState unguarded = ReadStableCurve(candidate);
+            if (profile.ValidateTargets)
+            {
+                AssertStableRuntimeSample(candidate, unguarded.Curve, checkCurveHysteresis: true);
+            }
+            ReadAndAssertTelemetry(candidate);
+            profile.AssertNativeIdentity(
+                discoveredIdentity,
+                candidate.Read(M1EcLayout.NativeIdentityAddresses));
+            AssertStartupProbe(candidate);
+            return new StartupProbeResult(unguarded, $"selector 0x{unguarded.Mode:x2}");
+        }
 
+        (CurveState captured, CurveStartupClassification classification) =
+            CaptureClassifiedCurve(candidate);
+
+        if (classification.State == CurveStartupState.Firmware)
+        {
+            if (profile.ValidateTargets)
+            {
+                AssertStableRuntimeSample(candidate, captured.Curve, checkCurveHysteresis: true);
+            }
+            ReadAndAssertTelemetry(candidate);
+            profile.AssertNativeIdentity(
+                discoveredIdentity,
+                candidate.Read(M1EcLayout.NativeIdentityAddresses));
+            AssertStartupProbe(candidate);
+            return new StartupProbeResult(captured, $"selector 0x{captured.Mode:x2}");
+        }
+
+        // Recoverable leftover or interrupted plugin state: complete all read-only
+        // admission gates before writing the canonical stock baseline back to XRAM.
         if (profile.ValidateTargets)
         {
-            AssertStableRuntimeSample(candidate, startup.Curve);
+            AssertStableRuntimeSample(candidate, captured.Curve, checkCurveHysteresis: false);
         }
-        M1Telemetry telemetry = M1TelemetryDecoder.Decode(
-            candidate.Read(M1EcLayout.TelemetryAddresses));
-        profile.AssertTelemetry(telemetry);
+        ReadAndAssertTelemetry(candidate);
+        profile.AssertNativeIdentity(
+            discoveredIdentity,
+            candidate.Read(M1EcLayout.NativeIdentityAddresses));
+        AssertStartupProbe(candidate);
+
+        CurveState preWrite = ReadCurveOnce(candidate);
+        if (preWrite.Mode != captured.Mode || !preWrite.Curve.SequenceEqual(captured.Curve))
+        {
+            throw new IOException(
+                $"{profile.ModelName} EC curve changed before startup recovery.");
+        }
+
+        byte[] canonicalCurve = classification.CanonicalCurve ??
+            throw new InvalidOperationException("Canonical startup curve is unavailable.");
+        byte[] canonicalOwned = M1EcLayout.CaptureOwned(canonicalCurve);
+        candidate.Write(M1EcLayout.AllRestoreWrites(canonicalOwned));
 
         profile.AssertNativeIdentity(
             discoveredIdentity,
             candidate.Read(M1EcLayout.NativeIdentityAddresses));
         AssertStartupProbe(candidate);
-        return startup;
+        CurveState verified = ReadStableCurve(candidate);
+        if (verified.Mode != captured.Mode || !verified.Curve.SequenceEqual(canonicalCurve))
+        {
+            throw new IOException(
+                $"{profile.ModelName} EC startup curve recovery did not verify exactly.");
+        }
+
+        return new StartupProbeResult(
+            verified,
+            $"selector 0x{verified.Mode:x2}; startup recovery restored firmware curve " +
+            $"from {classification.Detail}");
     }
 
-    private CurveState CaptureStockCurve(IM1TransportAccess candidate)
+    private (CurveState Curve, CurveStartupClassification Classification)
+        CaptureClassifiedCurve(IM1TransportAccess candidate)
     {
         CurveState? previous = null;
+        string? lastUnsupportedDetail = null;
         Exception? lastFailure = null;
         for (int attempt = 0; attempt < CurveSnapshotAttempts; attempt++)
         {
             try
             {
                 CurveState current = ReadCurveOnce(candidate);
-                if (!profile.MatchesCurve(current.Mode, current.Curve))
+                CurveStartupClassification classification =
+                    profile.ClassifyStartupCurve(current.Mode, current.Curve);
+                if (classification.State == CurveStartupState.Unsupported)
                 {
                     previous = null;
+                    lastUnsupportedDetail = classification.Detail;
                     continue;
                 }
                 if (previous is not null &&
                     previous.Mode == current.Mode &&
                     previous.Curve.SequenceEqual(current.Curve))
                 {
-                    return current;
+                    return (current, classification);
                 }
                 previous = current;
             }
@@ -315,9 +440,62 @@ internal sealed class PawnIoM1Backend : IM1Backend
             }
         }
 
-        throw new PlatformNotSupportedException(
-            $"{profile.ModelName} did not present two stable, exact EC stock-curve snapshots.",
-            lastFailure);
+        string message = lastUnsupportedDetail is not null
+            ? $"{profile.ModelName} did not present an accepted stock or recoverable " +
+              $"EC curve ({lastUnsupportedDetail})."
+            : $"{profile.ModelName} did not present two stable EC curve snapshots.";
+        throw new PlatformNotSupportedException(message, lastFailure);
+    }
+
+    private M1Telemetry ReadAndAssertTelemetry(IM1TransportAccess access)
+    {
+        byte[] sample = access.Read(M1EcLayout.TelemetryAddresses);
+        if (sample.Length != M1EcLayout.TelemetryAddresses.Length)
+        {
+            throw new IOException(
+                $"EC telemetry read returned {sample.Length} bytes; " +
+                $"expected {M1EcLayout.TelemetryAddresses.Length}.");
+        }
+
+        int cpuRpm = ReadStableRpm(
+            access,
+            sample.AsSpan(0, 3),
+            M1EcLayout.CpuRpmAddresses,
+            "CPU");
+        int systemRpm = ReadStableRpm(
+            access,
+            sample.AsSpan(3, 3),
+            M1EcLayout.SystemRpmAddresses,
+            "system");
+        M1Telemetry telemetry = new(cpuRpm, systemRpm, sample[6], sample[7]);
+        profile.AssertTelemetry(telemetry);
+        return telemetry;
+    }
+
+    private static int ReadStableRpm(
+        IM1TransportAccess access,
+        ReadOnlySpan<byte> initial,
+        ushort[] addresses,
+        string name)
+    {
+        for (int attempt = 0; attempt < RpmRetryAttempts; attempt++)
+        {
+            ReadOnlySpan<byte> sample = attempt == 0
+                ? initial
+                : access.Read(addresses);
+            if (sample.Length != 3)
+            {
+                throw new IOException(
+                    $"EC {name} RPM read returned {sample.Length} bytes; expected 3.");
+            }
+            if (M1TelemetryDecoder.TryDecodeRpm(sample, out int rpm))
+            {
+                return rpm;
+            }
+        }
+
+        throw new IOException(
+            $"The EC {name} RPM mirror did not produce a stable sample.");
     }
 
     private static CurveState ReadStableCurve(IM1TransportAccess candidate)
@@ -372,7 +550,8 @@ internal sealed class PawnIoM1Backend : IM1Backend
 
     private void AssertStableRuntimeSample(
         IM1TransportAccess candidate,
-        ReadOnlySpan<byte> curve)
+        ReadOnlySpan<byte> curve,
+        bool checkCurveHysteresis)
     {
         byte[]? previous = null;
         Exception? lastFailure = null;
@@ -381,7 +560,7 @@ internal sealed class PawnIoM1Backend : IM1Backend
             try
             {
                 byte[] current = candidate.Read(M1EcLayout.RuntimeSampleAddresses);
-                profile.AssertRuntimeSample(current, curve);
+                profile.AssertRuntimeSample(current, curve, checkCurveHysteresis);
                 if (previous is not null && previous.SequenceEqual(current))
                 {
                     return;
@@ -411,6 +590,10 @@ internal sealed class PawnIoM1Backend : IM1Backend
         if (current.Mode != baselineMode ||
             !current.Curve.SequenceEqual(ActiveExpectedCurve()))
         {
+            if (profile.MatchesCurve(current.Mode, current.Curve))
+            {
+                AcceptStockReset(current);
+            }
             throw new InvalidOperationException(
                 $"{profile.ModelName} EC curve ownership changed outside the plugin; " +
                 "refusing to write.");
@@ -464,6 +647,12 @@ internal sealed class PawnIoM1Backend : IM1Backend
         try
         {
             CurveState current = ReadRuntimeState(active);
+            if (current.Mode != baselineMode &&
+                profile.MatchesCurve(current.Mode, current.Curve))
+            {
+                AcceptStockReset(current);
+                return true;
+            }
             if (!CanRecover(current, previous, attempted))
             {
                 return false;
@@ -493,15 +682,15 @@ internal sealed class PawnIoM1Backend : IM1Backend
             return false;
         }
 
-        HashSet<ushort> owned = M1EcLayout.OwnedAddresses.ToHashSet();
+        byte[] baseline = ActiveBaselineCurve();
         for (int offset = 0; offset < current.Curve.Length; offset++)
         {
             byte value = current.Curve[offset];
-            if (owned.Contains((ushort)(M1EcLayout.CurveBlockStart + offset)))
+            if (M1EcLayout.IsOwnedOffset(offset))
             {
                 if (value != previous[offset] &&
                     value != attempted[offset] &&
-                    value != ActiveBaselineCurve()[offset])
+                    value != baseline[offset])
                 {
                     return false;
                 }
@@ -516,9 +705,16 @@ internal sealed class PawnIoM1Backend : IM1Backend
 
     private void RestoreForDispose(IM1TransportAccess active)
     {
+        CurveState current = ReadRuntimeState(active);
+        if (profile.MatchesCurve(current.Mode, current.Curve) &&
+            (recoveryCurve is null || current.Mode != baselineMode))
+        {
+            AcceptStockReset(current);
+            return;
+        }
+
         byte[] previous = (byte[])ActiveExpectedCurve().Clone();
         byte[] attempted = recoveryCurve ?? ActiveBaselineCurve();
-        CurveState current = ReadRuntimeState(active);
         if (!CanRecover(current, previous, attempted))
         {
             throw new InvalidOperationException(
@@ -538,6 +734,14 @@ internal sealed class PawnIoM1Backend : IM1Backend
                 throw;
             }
         }
+    }
+
+    private void AcceptStockReset(CurveState stockState)
+    {
+        baselineMode = stockState.Mode;
+        baselineCurve = (byte[])stockState.Curve.Clone();
+        baselineOwned = M1EcLayout.CaptureOwned(stockState.Curve);
+        ResetToBaseline();
     }
 
     private IM1Transport ActiveTransport() => transport ??
@@ -595,11 +799,15 @@ internal sealed class PawnIoM1Backend : IM1Backend
         baselineOwned = null;
         expectedCurve = null;
         recoveryCurve = null;
+        startupSummary = null;
         cpuCode = null;
         systemCode = null;
         needsRestore = false;
         ActiveSlot = null;
     }
+
+    private static Exception Combine(Exception? first, Exception second) =>
+        first is null ? second : new AggregateException(first, second);
 
     private sealed record ControllerCandidate(
         byte Slot,
@@ -607,4 +815,6 @@ internal sealed class PawnIoM1Backend : IM1Backend
         byte[] OuterIdentity);
 
     private sealed record CurveState(byte Mode, byte[] Curve);
+
+    private sealed record StartupProbeResult(CurveState Curve, string Summary);
 }
